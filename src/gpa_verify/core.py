@@ -59,9 +59,8 @@ from __future__ import annotations
 import hashlib
 import io
 import json
-import re
 import zipfile
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -245,8 +244,10 @@ def check_bundle_integrity(zf: zipfile.ZipFile, manifest: Dict[str, Any]) -> Che
     if passed:
         detail_parts.append(f"{checked}/{len(files_meta)} files OK")
     else:
-        if missing: detail_parts.append(f"{len(missing)} missing")
-        if mismatches: detail_parts.append(f"{len(mismatches)} mismatched")
+        if missing:
+            detail_parts.append(f"{len(missing)} missing")
+        if mismatches:
+            detail_parts.append(f"{len(mismatches)} mismatched")
     if extras:
         detail_parts.append(f"{len(extras)} extra file(s)")
 
@@ -872,8 +873,8 @@ def check_tls_evidence(zf: zipfile.ZipFile) -> CheckResult:
     # Extract DER from PEM
     pem_lines = leaf_pem.decode("ascii", errors="replace").split("\n")
     der_b64 = "".join(
-        l for l in pem_lines
-        if l and "BEGIN CERT" not in l and "END CERT" not in l
+        line for line in pem_lines
+        if line and "BEGIN CERT" not in line and "END CERT" not in line
     )
     try:
         import base64
