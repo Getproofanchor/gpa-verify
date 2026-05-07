@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gpa-verify"
+version = "1.0.0"
+description = "Independent verifier for GetProofAnchor evidence bundles"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+authors = [
+    { name = "GetProofAnchor", email = "support@getproofanchor.com" },
+]
+keywords = ["forensic", "evidence", "rfc3161", "eidas", "opentimestamps", "verification"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Legal Industry",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security :: Cryptography",
+    "Topic :: System :: Archiving",
+]
+dependencies = [
+    "asn1crypto>=1.5",
+    "cryptography>=41.0",
+]
+
+[project.urls]
+Homepage = "https://getproofanchor.com"
+Repository = "https://github.com/getproofanchor/gpa-verify"
+Issues = "https://github.com/getproofanchor/gpa-verify/issues"
+
+[project.scripts]
+gpa-verify = "gpa_verify.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gpa_verify"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/README.md",
+    "/LICENSE",
+    "/CHANGELOG.md",
+]
