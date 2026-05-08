@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.1.0 (2026-05-07)
+
+**Stamp-5 forensic asset binding validation**
+
+Adds new cross-check that validates, for stamp-5 archives, that
+each declared asset hash in eidas_payload.json matches the actual
+file in the archive. This makes it cryptographically impossible to
+swap any forensic artifact (HAR, video, TLS PEM) post-timestamping
+without the verifier detecting it.
+
+### Added
+- cross_references reads timestamp/eidas_payload.json and validates
+  each declared artifact hash against the matching file
+- New check entries: eidas_payload_format, stamp5_direct_binding
+- 14 cross-checks on full stamp-5 server proof (was 4)
+
+### Compatibility
+- All stamp-3 and stamp-4 archives verify identically
+- Forward-compatible with backend v1.8.8 stamp-5 emission
+
+
 All notable changes to `gpa-verify` will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),

@@ -357,6 +357,78 @@ def check_cross_references(
                 "sidecar_value": declared,
             })
 
+    # ── eidas_payload.json ↔ actual file hashes cross-validation ──
+    # Reads the eIDAS payload (which is what the TSA actually signed
+    # over) and confirms each declared asset hash matches the actual
+    # file on disk inside the archive. This is the critical "trust
+    # what was timestamped" check: if an attacker swapped any file
+    # AFTER timestamping but kept proof.json self-consistent, this
+    # would still detect the tampering, because eidas_payload.json
+    # is bound to the TSA signature.
+    #
+    # Supports stamp-3, stamp-4 (core 4 hashes only) and stamp-5
+    # (which additionally binds har_sha256, video_sha256,
+    # tls_leaf_pem_sha256, tls_chain_pem_sha256 directly — closing the
+    # forensic gap where optional artifacts were not under the TSA
+    # signature in older formats).
+    if eidas_payload is not None:
+        try:
+            ep = json.loads(eidas_payload.decode("utf-8"))
+        except Exception:
+            ep = None
+        if isinstance(ep, dict):
+            ep_format = ep.get("format") or "(unknown)"
+            checks.append((f"eidas_payload_format ({ep_format})", "ok"))
+
+            # Every hash field in the payload must match the actual file's
+            # content hash. We map payload field name → archive path.
+            asset_map = {
+                "screenshot_sha256":      "screenshot.png",
+                "raw_html_sha256":        "page.html",
+                "content_sha256":         "content.txt",
+                "capture_meta_sha256":    "capture/capture_meta.json",
+                # stamp-5 additions:
+                "har_sha256":             "network/capture.har",
+                "video_sha256":           "capture.webm",
+                "tls_leaf_pem_sha256":    "tls/leaf_cert.pem",
+                "tls_chain_pem_sha256":   "tls/chain.pem",
+            }
+            stamp5_fields_present = []
+            for field, archive_path in asset_map.items():
+                declared = ep.get(field)
+                if not declared:
+                    continue
+                file_data = _read_zip_file(zf, archive_path)
+                if file_data is None:
+                    failures.append({
+                        "check": f"eidas_payload_vs_{field}",
+                        "error": f"{archive_path} declared in eidas_payload but missing from archive",
+                        "expected": declared,
+                    })
+                    checks.append((f"eidas_payload_vs_{field}", "fail"))
+                    continue
+                actual = _sha256(file_data)
+                if actual != declared:
+                    failures.append({
+                        "check": f"eidas_payload_vs_{field}",
+                        "expected": declared,
+                        "actual": actual,
+                        "file": archive_path,
+                        "note": "Hash declared in TSA-signed eidas_payload.json does not match file in archive — possible post-timestamp tampering.",
+                    })
+                    checks.append((f"eidas_payload_vs_{field}", "fail"))
+                else:
+                    checks.append((f"eidas_payload_vs_{field}", "ok"))
+                    if field in ("har_sha256", "video_sha256", "tls_leaf_pem_sha256", "tls_chain_pem_sha256"):
+                        stamp5_fields_present.append(field)
+
+            # Informational note about stamp-5 binding strength
+            if stamp5_fields_present:
+                checks.append((
+                    f"stamp5_direct_binding ({', '.join(stamp5_fields_present)})",
+                    "ok",
+                ))
+
     return CheckResult(
         name="cross_references",
         passed=not failures,

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "gpa-verify"
-version = "1.0.0"
+version = "1.1.0"
 description = "Independent verifier for GetProofAnchor evidence bundles"
 readme = "README.md"
 requires-python = ">=3.9"
