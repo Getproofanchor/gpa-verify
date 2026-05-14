@@ -172,6 +172,8 @@ def _read_zip_text(zf: zipfile.ZipFile, name: str) -> Optional[str]:
 SUPPORTED_FORMATS = frozenset({
     "getproofanchor-evidence-1",
     "getproofanchor-evidence-2",
+    "getproofanchor-evidence-3",  # Added in 1.2.0
+    "getproofanchor-evidence-4",  # Added in 1.2.0 — M-6b: per-country TSL bundles
 })
 
 
