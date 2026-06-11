@@ -116,6 +116,45 @@ def test_tamper_screenshot_one_byte_detected(fixture_zip: bytes):
     assert any(m.get("file") == "screenshot.png" for m in mismatches)
 
 
+def _zip_has(fixture_zip: bytes, arcname: str) -> bool:
+    with zipfile.ZipFile(io.BytesIO(fixture_zip), "r") as zf:
+        return arcname in zf.namelist()
+
+
+def test_mhtml_verified_when_present(fixture_zip: bytes):
+    """If page.mhtml is in the bundle (stamp-6), the verifier must actively
+    cross-check it — both proof.json (page_mhtml) and the TSA-signed
+    eidas_payload (eidas_payload_vs_mhtml_sha256). Skipped for older
+    bundles without MHTML."""
+    if not _zip_has(fixture_zip, "page.mhtml"):
+        pytest.skip("fixture has no page.mhtml (pre-stamp-6 bundle)")
+    report = verify_evidence_zip(fixture_zip)
+    xref = next(c for c in report.checks if c.name == "cross_references")
+    checks = xref.extra.get("checks", {})
+    # The MHTML must be checked against proof.json AND against the TSA payload.
+    assert checks.get("page_mhtml") == "ok", "page.mhtml not cross-checked vs proof.json"
+    assert checks.get("eidas_payload_vs_mhtml_sha256") == "ok", \
+        "page.mhtml not verified against TSA-signed eidas_payload"
+
+
+def test_tamper_mhtml_one_byte_detected(fixture_zip: bytes):
+    """Flipping one byte in page.mhtml must be detected (stamp-6 binding).
+    Skipped when the fixture has no MHTML."""
+    if not _zip_has(fixture_zip, "page.mhtml"):
+        pytest.skip("fixture has no page.mhtml (pre-stamp-6 bundle)")
+    tampered = _modify_zip_file(
+        fixture_zip,
+        "page.mhtml",
+        lambda d: d[:-1] + bytes([d[-1] ^ 1]) if d else d,
+    )
+    report = verify_evidence_zip(tampered)
+    assert report.any_failed, "tampered page.mhtml not detected"
+    integrity = next(c for c in report.checks if c.name == "bundle_integrity")
+    assert not integrity.passed
+    mismatches = integrity.extra.get("mismatches", [])
+    assert any(m.get("file") == "page.mhtml" for m in mismatches)
+
+
 def test_tamper_eidas_tsr_detected(fixture_zip: bytes):
     """Replacing eidas.tsr must be detected (integrity OR signature)."""
     tampered = _modify_zip_file(

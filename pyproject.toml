@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "gpa-verify"
-version = "1.2.0"
+version = "1.3.0"
 description = "Independent verifier for GetProofAnchor evidence bundles"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -52,4 +52,12 @@ include = [
     "/README.md",
     "/LICENSE",
     "/CHANGELOG.md",
+]
+# Evidence-ZIP fixtures are large (tens of MB) real bundles used only by the
+# test suite. They live in the git repo so `git clone && pytest` works, but
+# they are excluded from the PyPI sdist to keep the published package small.
+# CI and contributors run the full suite against the repo; the shipped sdist
+# stays lean (verification code only).
+exclude = [
+    "/tests/fixtures/*.zip",
 ]

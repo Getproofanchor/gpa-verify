@@ -1,5 +1,45 @@
 # Changelog
 
+## 1.3.0 (2026-06-10)
+
+**Stamp-6 MHTML snapshot binding validation**
+
+Production bundles emitted since backend v1.10.0 (server captures) and
+extension v1.10.1 (browser captures) include a `page.mhtml` offline
+snapshot whose SHA-256 is bound directly into the eIDAS stamp-6 payload
+(`getproofanchor-eidas-stamp-6`). Verifier 1.2.0 verified such bundles
+as a whole (the `page.mhtml` file was hashed by `bundle_integrity` like
+any other manifest entry) but did NOT cross-check `page.mhtml` against
+the TSA-signed `eidas_payload.json` or against `proof.json`. MHTML was
+therefore covered by the manifest but not by the strongest "trust only
+what was timestamped" check.
+
+This release closes that gap: `page.mhtml` is now validated the same way
+stamp-5 artifacts (HAR, video, TLS PEM) are — its hash must match both
+`proof.json` (`mhtml_sha256`) and the TSA-signed eidas payload. Swapping
+`page.mhtml` after timestamping is now cryptographically detectable.
+
+### Added
+- `cross_references` checks `page.mhtml` against `proof.json.mhtml_sha256`
+  (new sub-check `page_mhtml`).
+- `cross_references` adds `mhtml_sha256 -> page.mhtml` to the eidas-payload
+  asset map (new sub-check `eidas_payload_vs_mhtml_sha256`), so MHTML is
+  verified under the TSA signature.
+- MHTML included in the direct-binding informational note (renamed from
+  `stamp5_direct_binding` to `direct_binding` to cover stamp-5 and stamp-6).
+- Test fixtures: real stamp-6 server and browser evidence bundles.
+- Regression tests: `test_mhtml_verified_when_present`,
+  `test_tamper_mhtml_one_byte_detected` (auto-skip on pre-stamp-6 bundles).
+
+### Compatibility
+- Pre-stamp-6 bundles (no `page.mhtml`) verify identically — the MHTML
+  checks are no-ops when `proof.json` declares no `mhtml_sha256`.
+- Captures where MHTML failed (graceful degradation, NULL mhtml fields)
+  verify identically — no false failures.
+- The seven top-level check layers are unchanged; MHTML is a sub-check
+  within `cross_references`, so `checks_total` stays 7.
+- Browser captures continue to SKIP `tls_evidence` (no server-side TLS PEM).
+
 ## 1.2.0 (2026-05-14)
 
 **Accept evidence-3 and evidence-4 bundle formats**

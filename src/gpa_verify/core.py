@@ -313,6 +313,12 @@ def check_cross_references(
     _check_sha_match("screenshot.png", proof.get("screenshot_sha256"), "screenshot")
     _check_sha_match("page.html", proof.get("raw_html_sha256"), "page_html")
     _check_sha_match("content.txt", proof.get("content_sha256"), "content")
+    # v1.3.0: MHTML snapshot (stamp-6). Optional artifact — only checked when
+    # proof.json declares mhtml_sha256 (server captures since backend v1.10.0,
+    # browser captures since extension v1.10.1). Absent on older proofs and on
+    # captures where MHTML failed (graceful degradation) — _check_sha_match
+    # is a no-op when expected is falsy, so this never false-fails.
+    _check_sha_match("page.mhtml", proof.get("mhtml_sha256"), "page_mhtml")
 
     capture = proof.get("capture") or {}
     _check_sha_match(
@@ -394,6 +400,10 @@ def check_cross_references(
                 "video_sha256":           "capture.webm",
                 "tls_leaf_pem_sha256":    "tls/leaf_cert.pem",
                 "tls_chain_pem_sha256":   "tls/chain.pem",
+                # stamp-6 addition (backend v1.10.0 / extension v1.10.1):
+                # MHTML offline snapshot bound directly under the TSA
+                # signature. Present on both server and browser captures.
+                "mhtml_sha256":           "page.mhtml",
             }
             stamp5_fields_present = []
             for field, archive_path in asset_map.items():
@@ -421,13 +431,15 @@ def check_cross_references(
                     checks.append((f"eidas_payload_vs_{field}", "fail"))
                 else:
                     checks.append((f"eidas_payload_vs_{field}", "ok"))
-                    if field in ("har_sha256", "video_sha256", "tls_leaf_pem_sha256", "tls_chain_pem_sha256"):
+                    if field in ("har_sha256", "video_sha256", "tls_leaf_pem_sha256", "tls_chain_pem_sha256", "mhtml_sha256"):
                         stamp5_fields_present.append(field)
 
-            # Informational note about stamp-5 binding strength
+            # Informational note about direct-binding strength (stamp-5/stamp-6:
+            # optional artifacts — HAR, video, TLS PEM, MHTML — bound directly
+            # under the TSA signature rather than only via capture_meta).
             if stamp5_fields_present:
                 checks.append((
-                    f"stamp5_direct_binding ({', '.join(stamp5_fields_present)})",
+                    f"direct_binding ({', '.join(stamp5_fields_present)})",
                     "ok",
                 ))
 
