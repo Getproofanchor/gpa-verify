@@ -59,20 +59,69 @@ def test_pristine_bundle_verifies(fixture_zip: bytes):
 
 
 def test_check_count(fixture_zip: bytes):
-    """All 7 verification layers must run."""
+    """All 8 verification layers must run."""
     report = verify_evidence_zip(fixture_zip)
-    assert report.summary["checks_total"] == 7
+    assert report.summary["checks_total"] == 8
     expected_layers = {
         "bundle_integrity",
         "cross_references",
         "chain_integrity",
         "eidas_signature",
+        "tsl_qualified",
         "anchor_canonical_hash",
         "ots_receipt",
         "tls_evidence",
     }
     actual = {c.name for c in report.checks}
     assert actual == expected_layers
+
+
+def test_tsl_qualified_when_present(fixture_zip: bytes):
+    """If a Trusted List is bundled (timestamp/tsl/*.xml), the verifier must
+    confirm the TSA signer cert is a granted, qualified TSA/QTST service.
+    Skipped for older bundles without a bundled TSL."""
+    if not _zip_has(fixture_zip, "timestamp/tsl"):
+        # crude prefix check via namelist
+        with zipfile.ZipFile(io.BytesIO(fixture_zip)) as zf:
+            if not any(n.startswith("timestamp/tsl/") and n.endswith(".xml")
+                       for n in zf.namelist()):
+                pytest.skip("no bundled Trusted List")
+    report = verify_evidence_zip(fixture_zip)
+    tsl = next(c for c in report.checks if c.name == "tsl_qualified")
+    assert tsl.passed and not tsl.skipped, f"tsl_qualified did not pass: {tsl.detail}"
+    assert tsl.extra.get("service_status") == "granted"
+    assert tsl.extra.get("service_type") == "TSA/QTST"
+
+
+def test_tamper_tsl_cert_swap_detected():
+    """If the bundled TSL is replaced with one that does NOT list the signer
+    cert as a granted qualified TSA, tsl_qualified must FAIL. We simulate by
+    stripping all X509Certificate entries from the bundled EE.xml."""
+    import re
+    target_data = None
+    tsl_name = None
+    for fx in FIXTURES.glob("*.zip") if FIXTURES.exists() else []:
+        data = fx.read_bytes()
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            for n in zf.namelist():
+                if n.startswith("timestamp/tsl/") and n.endswith(".xml"):
+                    target_data, tsl_name = data, n
+                    break
+        if target_data is not None:
+            break
+    if target_data is None:
+        pytest.skip("no fixture with a bundled TSL")
+
+    def _gut_tsl(xml_bytes: bytes) -> bytes:
+        text = xml_bytes.decode("utf-8", "replace")
+        text = re.sub(r"<X509Certificate>.*?</X509Certificate>", "", text,
+                      flags=re.DOTALL)
+        return text.encode("utf-8")
+
+    tampered = _modify_zip_file(target_data, tsl_name, _gut_tsl)
+    report = verify_evidence_zip(tampered)
+    tsl = next(c for c in report.checks if c.name == "tsl_qualified")
+    assert not tsl.passed and not tsl.skipped, "gutted TSL should fail tsl_qualified"
 
 
 def test_proof_id_extracted(fixture_zip: bytes):

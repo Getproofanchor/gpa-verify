@@ -126,6 +126,19 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="disable ANSI colour output",
     )
+    parser.add_argument(
+        "--bitcoin-rpc",
+        metavar="URL",
+        default=None,
+        help=(
+            "Bitcoin Core JSON-RPC URL of a node YOU operate "
+            "(e.g. http://user:pass@127.0.0.1:8332). Enables REAL Bitcoin "
+            "block verification of the OTS receipt against your own node — "
+            "no calendars, no explorers, receipt never modified. Without this "
+            "flag the tool is fully offline and reports Bitcoin status from "
+            "the manifest only."
+        ),
+    )
     args = parser.parse_args(argv)
 
     if not args.zip_path.exists():
@@ -141,7 +154,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: cannot read {args.zip_path}: {exc}", file=sys.stderr)
         return 2
 
-    report = verify_evidence_zip(zip_bytes)
+    report = verify_evidence_zip(zip_bytes, bitcoin_rpc=args.bitcoin_rpc)
 
     if args.json:
         json.dump(report.to_dict(), sys.stdout, indent=2, ensure_ascii=False)

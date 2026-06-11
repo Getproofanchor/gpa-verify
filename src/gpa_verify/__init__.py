@@ -7,7 +7,7 @@ any GetProofAnchor server — given an evidence ZIP and the bundled
 artifacts, it produces a deterministic verdict.
 """
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 from .core import (
     CheckResult,

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "gpa-verify"
-version = "1.3.0"
+version = "1.4.0"
 description = "Independent verifier for GetProofAnchor evidence bundles"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -32,6 +32,14 @@ classifiers = [
 dependencies = [
     "asn1crypto>=1.5",
     "cryptography>=41.0",
+]
+
+# Optional extra: real Bitcoin block verification (--bitcoin-rpc). The core
+# offline verifier needs none of this; install with `pip install gpa-verify[bitcoin]`
+# only if you want to verify OTS receipts against your own Bitcoin node.
+[project.optional-dependencies]
+bitcoin = [
+    "opentimestamps>=0.4",
 ]
 
 [project.urls]

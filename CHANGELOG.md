@@ -1,5 +1,60 @@
 # Changelog
 
+## 1.4.0 (2026-06-11)
+
+### Added — two new verification capabilities
+
+**Layer 8: `tsl_qualified` — EU Trusted List qualified-status check (offline).**
+Previously the tool proved the RFC3161 token was signed by the cert embedded
+in it and that the cert carried the timeStamping EKU — but it did *not* prove
+that cert is a *qualified* TSU recognised by an EU member state. A self-issued
+cert can also carry a timeStamping EKU. This layer closes that gap: it parses
+the EU Trusted List bundled in the evidence ZIP (`timestamp/tsl/<CC>.xml`,
+ETSI TS 119 612) and confirms the signer certificate is listed under a service
+that is BOTH type `TSA/QTST` (Qualified Time Stamp) AND status `granted`.
+Fully offline, no network. Skips cleanly (not fails) on older bundles that
+predate per-country TSL bundling.
+
+**`--bitcoin-rpc URL`: real Bitcoin block verification (opt-in, online).**
+By default the OTS layer stays fully offline and reports Bitcoin status from
+the manifest only (an assertion by the producer). With `--bitcoin-rpc`
+pointing at a Bitcoin Core node **you operate**, the tool now performs REAL
+verification: it reads the receipt's `BitcoinBlockHeaderAttestation`,
+fetches the attested block's header via `getblockhash`/`getblockheader`, and
+confirms the OTS-committed merkle root equals the block header's merkleroot
+using the canonical `opentimestamps` library. No calendars, no block
+explorers — the only network call is to your own node. The receipt is read,
+never upgraded or modified. If the receipt has no Bitcoin attestation yet
+(still pending across calendars), online mode says so honestly rather than
+claiming "confirmed".
+
+### Changed
+- Verification layers: 7 → 8 (`tsl_qualified` inserted after `eidas_signature`).
+- `verify_evidence_zip(zip_bytes, *, bitcoin_rpc=None)` — new keyword-only arg.
+  The default call is unchanged and remains a pure offline function.
+- Module docstring and layer numbering updated.
+
+### Dependencies
+- New optional extra `bitcoin` (pulls `opentimestamps`). Install with
+  `pip install gpa-verify[bitcoin]` only if you want `--bitcoin-rpc`. The core
+  offline verifier still needs only `asn1crypto` + `cryptography`.
+
+### Tests
+- `test_check_count` updated to 8 layers.
+- Added `test_tsl_qualified_when_present` (passes on bundles with a TSL,
+  skips otherwise) and `test_tamper_tsl_cert_swap_detected` (gutting the
+  bundled TSL's certs makes `tsl_qualified` fail).
+- Bitcoin merkle-verification logic proven with the real `opentimestamps`
+  library against a mocked node (correct root verifies; wrong root rejected).
+
+### Notes / honest limitations
+- `tsl_qualified` validates against the TSL *bundled in the evidence* and
+  reflects status as of that snapshot. It does not (yet) validate the TSL's
+  own XML signature against the EU List-of-Lists (LOTL) trust anchor — that
+  is a heavier separate step on the roadmap.
+- Offline mode still cannot confirm Bitcoin block inclusion (by design); use
+  `--bitcoin-rpc` for that.
+
 ## 1.3.0 (2026-06-10)
 
 **Stamp-6 MHTML snapshot binding validation**

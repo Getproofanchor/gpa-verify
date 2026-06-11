@@ -33,25 +33,36 @@ Verification layers (each tightens forensic claim):
                                    matches eidas_payload SHA-256.
                                    Catches: forged timestamps; substituted
                                    payload; hostile TSA impersonation.
-  Layer 5  Anchor canonical hash — manifest.anchor.payload_sha256 equals
+  Layer 5  TSL qualified status   — signer cert is listed as a granted
+                                   TSA/QTST (Qualified Time Stamp) service in
+                                   the bundled EU Trusted List. Offline.
+                                   Catches: a validly-signed but NON-qualified
+                                   timestamp (e.g. self-issued cert with a
+                                   timeStamping EKU that no member state lists).
+  Layer 6  Anchor canonical hash — manifest.anchor.payload_sha256 equals
                                    SHA-256 of canonical JSON of
                                    anchor/anchor_payload.json.
                                    Catches: anchor receipt pointing to a
                                    different chain than ours.
-  Layer 6  OTS receipt structure — anchor/anchor_receipt.ots is a valid
+  Layer 7  OTS receipt           — anchor/anchor_receipt.ots is a valid
                                    OpenTimestamps proof, file-hash field
-                                   matches anchor canonical SHA.
-                                   Catches: substituted Bitcoin anchor.
-  Layer 7  TLS chain validity    — leaf_cert.pem subject + SAN consistent
+                                   matches anchor canonical SHA. With
+                                   --bitcoin-rpc, additionally verifies the
+                                   receipt's Bitcoin block attestation against
+                                   the operator's OWN node (real merkle-root
+                                   check; receipt never modified).
+                                   Catches: substituted Bitcoin anchor;
+                                   (online) false claims of block inclusion.
+  Layer 8  TLS chain validity    — leaf_cert.pem subject + SAN consistent
                                    with network/tls.json claim; chain
                                    resolves to a public CA.
 
-After all 7 layers pass, the verdict is: this evidence existed in this
+After all layers pass, the verdict is: this evidence existed in this
 exact form before the eIDAS timestamp's gen_time, was sealed by a
-qualified TSA, was anchored to Bitcoin, and was served by the named
-domain at capture time. Each link is independently verifiable by any
-expert with this tool and the bundled artifacts — no GetProofAnchor
-server needed.
+qualified TSA listed in the EU Trusted List, was anchored to Bitcoin,
+and was served by the named domain at capture time. Each link is
+independently verifiable by any expert with this tool and the bundled
+artifacts — no GetProofAnchor server needed.
 """
 
 from __future__ import annotations
@@ -836,9 +847,123 @@ def check_anchor_canonical_hash(
 # Layer 6 — OTS receipt structure
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _bitcoin_verify_via_node(receipt_bytes: bytes, rpc_url: str) -> Dict[str, Any]:
+    """Verify the OTS receipt's Bitcoin attestation(s) against the operator's
+    own Bitcoin Core node via JSON-RPC. Returns a result dict; never raises.
+
+    Trust model: the ONLY external party trusted here is the node at rpc_url,
+    which the verifier operates. No calendars, no explorers. The receipt is
+    read, never modified or upgraded.
+
+    Steps per Bitcoin attestation in the receipt:
+      1. recompute the merkle root committed by the OTS path
+         (BitcoinBlockHeaderAttestation.verify_against_blockheader)
+      2. getblockhash(height) → getblockheader(hash) on the node
+      3. assert recomputed merkle root == block header merkleroot
+    """
+    result: Dict[str, Any] = {
+        "online": True, "rpc_reachable": False, "deps_missing": False,
+        "bitcoin_attestations": [], "verified_heights": [], "errors": [],
+    }
+    try:
+        import json as _json
+        import urllib.request
+        from opentimestamps.core.timestamp import DetachedTimestampFile
+        from opentimestamps.core.notary import (
+            BitcoinBlockHeaderAttestation, PendingAttestation,
+        )
+        from opentimestamps.core.serialize import StreamDeserializationContext
+        from opentimestamps.bitcoin import make_timestamp_from_block  # noqa: F401
+    except Exception as exc:
+        result["deps_missing"] = True
+        result["errors"].append(
+            f"opentimestamps not installed ({exc}); "
+            f"run: pip install gpa-verify[bitcoin]"
+        )
+        return result
+
+    def _rpc(method, params):
+        payload = _json.dumps(
+            {"jsonrpc": "1.0", "id": "gpa", "method": method, "params": params}
+        ).encode()
+        req = urllib.request.Request(
+            rpc_url, data=payload, headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = _json.loads(resp.read().decode())
+        if body.get("error"):
+            raise RuntimeError(body["error"])
+        return body["result"]
+
+    # Parse receipt
+    try:
+        ctx = StreamDeserializationContext(io.BytesIO(receipt_bytes))
+        detached = DetachedTimestampFile.deserialize(ctx)
+        ts = detached.timestamp
+    except Exception as exc:
+        result["errors"].append(f"cannot parse OTS receipt: {exc}")
+        return result
+
+    btc_atts = []
+    for msg, att in ts.all_attestations():
+        if isinstance(att, BitcoinBlockHeaderAttestation):
+            btc_atts.append((msg, att))
+    result["bitcoin_attestations"] = [a.height for _, a in btc_atts]
+    result["pending_count"] = sum(
+        1 for _, a in ts.all_attestations() if isinstance(a, PendingAttestation)
+    )
+
+    if not btc_atts:
+        # Honest: no Bitcoin block attestation present yet (still pending).
+        return result
+
+    # Probe node reachability once
+    try:
+        _rpc("getblockcount", [])
+        result["rpc_reachable"] = True
+    except Exception as exc:
+        result["errors"].append(f"node unreachable: {exc}")
+        return result
+
+    for msg, att in btc_atts:
+        h = att.height
+        try:
+            blockhash = _rpc("getblockhash", [h])
+            header = _rpc("getblockheader", [blockhash, True])
+            # The OTS lib compares the committed `msg` digest directly against
+            # block_header.hashMerkleRoot (32 bytes, internal/little-endian
+            # order) and returns the block nTime on success. The node reports
+            # merkleroot as display-order hex, so reverse it to internal order.
+            shim = _BlockHeaderShim(header)
+            block_time = att.verify_against_blockheader(msg, shim)
+            result["verified_heights"].append(h)
+            result.setdefault("block_times", {})[h] = block_time
+            result.setdefault("block_hashes", {})[h] = blockhash
+        except Exception as exc:
+            result["errors"].append(f"height {h}: {type(exc).__name__}: {exc}")
+
+    return result
+
+
+class _BlockHeaderShim:
+    """Minimal adapter so BitcoinBlockHeaderAttestation.verify_against_blockheader
+    can read fields from a getblockheader RPC dict.
+
+    The OTS lib does: `digest != block_header.hashMerkleRoot` (bytes compare)
+    and returns `block_header.nTime`. So we expose:
+      - hashMerkleRoot: 32 bytes in INTERNAL (little-endian) order. Bitcoin
+        Core reports merkleroot as display hex (big-endian), so we reverse.
+      - nTime: block timestamp (int).
+    """
+    def __init__(self, header_dict: Dict[str, Any]):
+        self.hashMerkleRoot = bytes.fromhex(header_dict["merkleroot"])[::-1]
+        self.nTime = int(header_dict.get("time", 0))
+
+
 def check_ots_receipt(
     zf: zipfile.ZipFile,
     manifest: Dict[str, Any],
+    bitcoin_rpc: Optional[str] = None,
 ) -> CheckResult:
     """OpenTimestamps receipt header is valid + leaf SHA matches anchor.
 
@@ -848,12 +973,21 @@ def check_ots_receipt(
         + 32-byte file hash  ← must match anchor canonical SHA
         + ... timestamp tree ...
 
-    Full ots-client verification calls a Bitcoin node or OTS calendars
-    and is therefore not offline. This check verifies the receipt is
-    structurally valid and references our exact anchor — that's enough
-    to confirm "this OTS file CAN attest THIS anchor". Whether it
-    HAS attested it depends on Bitcoin block confirmation, which is
-    out of scope for an offline verifier (use `ots verify` for that).
+    OFFLINE (default, bitcoin_rpc=None): verifies the receipt is structurally
+    valid and references our exact anchor — enough to confirm "this OTS file
+    CAN attest THIS anchor". Whether it HAS been confirmed in a Bitcoin block
+    is reported from the manifest only (an assertion by the producer, not a
+    proof). This keeps the default verifier fully offline & deterministic.
+
+    ONLINE (bitcoin_rpc set, e.g. http://user:pass@127.0.0.1:8332): performs
+    REAL Bitcoin verification against the operator's OWN node — no calendars,
+    no block explorers, no third party. It parses the embedded
+    BitcoinBlockHeaderAttestation(s), recomputes the merkle root from the OTS
+    path, fetches the attested block's header via getblockhash+getblockheader
+    RPC, and confirms the recomputed root equals the block's merkleroot. This
+    does NOT upgrade or modify the receipt — it only reads what is already in
+    it. If the receipt has no Bitcoin attestation yet (still pending across
+    calendars), online mode says so honestly rather than claiming confirmed.
     """
     receipt = _read_zip_file(zf, "anchor/anchor_receipt.ots")
     if receipt is None:
@@ -919,23 +1053,87 @@ def check_ots_receipt(
     ots_meta = manifest.get("ots") or {}
     btc_status = ots_meta.get("status")
 
+    # ── ONLINE Bitcoin verification (only when bitcoin_rpc provided) ──
+    # Reads the receipt's Bitcoin attestation(s) and checks them against the
+    # operator's own node. Never modifies/upgrades the receipt.
+    btc_online: Optional[Dict[str, Any]] = None
+    if bitcoin_rpc:
+        btc_online = _bitcoin_verify_via_node(receipt, bitcoin_rpc)
+        verified = btc_online.get("verified_heights") or []
+        atts = btc_online.get("bitcoin_attestations") or []
+        errs = btc_online.get("errors") or []
+        if atts and verified and not errs:
+            # Real, node-confirmed Bitcoin inclusion.
+            return CheckResult(
+                name="ots_receipt", passed=True,
+                detail=(
+                    f"BITCOIN-CONFIRMED via own node: anchor SHA "
+                    f"{file_hash_hex[:16]}... committed in block height(s) "
+                    f"{verified} (merkle root matches block header)"
+                ),
+                extra={
+                    "file_hash_sha256": file_hash_hex,
+                    "ots_version": version,
+                    "bitcoin_verification": "node_confirmed",
+                    "verified_block_heights": verified,
+                    "block_hashes": btc_online.get("block_hashes"),
+                    "block_times": btc_online.get("block_times"),
+                    "rpc_reachable": btc_online.get("rpc_reachable"),
+                },
+            )
+        if atts and errs:
+            # There IS a Bitcoin attestation but the node check failed —
+            # that is a genuine verification failure, not a "pending".
+            return CheckResult(
+                name="ots_receipt", passed=False,
+                detail=(
+                    f"Bitcoin attestation present (height(s) {atts}) but node "
+                    f"verification FAILED: {'; '.join(errs)}"
+                ),
+                extra={
+                    "file_hash_sha256": file_hash_hex,
+                    "bitcoin_verification": "node_failed",
+                    "bitcoin_attestations": atts,
+                    "errors": errs,
+                    "rpc_reachable": btc_online.get("rpc_reachable"),
+                },
+            )
+        # No Bitcoin attestation in the receipt yet → still pending. Online
+        # mode reports this honestly; it is not a failure (the timestamp is
+        # simply not yet anchored in a block across the calendars).
+
+    detail = (
+        f"valid OTS proof for anchor SHA {file_hash_hex[:16]}..., "
+        f"OTS version={version}, "
+        f"calendar attestations={pending_count}, "
+        f"bitcoin status={btc_status}"
+    )
+    extra = {
+        "file_hash_sha256": file_hash_hex,
+        "ots_version": version,
+        "calendar_attestation_count": pending_count,
+        "bitcoin_status": btc_status,
+        "bitcoin_block": ots_meta.get("bitcoin_block"),
+        "bitcoin_tx": ots_meta.get("bitcoin_tx"),
+    }
+    if btc_online is not None:
+        if btc_online.get("deps_missing"):
+            extra["bitcoin_verification"] = "skipped_deps_missing"
+            extra["online_errors"] = btc_online.get("errors")
+            detail += (
+                " [--bitcoin-rpc given but 'opentimestamps' not installed — "
+                "Bitcoin check skipped; run: pip install gpa-verify[bitcoin]]"
+            )
+        else:
+            extra["bitcoin_verification"] = "pending_no_block_attestation"
+            extra["pending_calendar_count"] = btc_online.get("pending_count")
+            extra["online_errors"] = btc_online.get("errors")
+            detail += " [online: no Bitcoin block attestation in receipt yet — pending]"
     return CheckResult(
         name="ots_receipt",
         passed=True,
-        detail=(
-            f"valid OTS proof for anchor SHA {file_hash_hex[:16]}..., "
-            f"OTS version={version}, "
-            f"calendar attestations={pending_count}, "
-            f"bitcoin status={btc_status}"
-        ),
-        extra={
-            "file_hash_sha256": file_hash_hex,
-            "ots_version": version,
-            "calendar_attestation_count": pending_count,
-            "bitcoin_status": btc_status,
-            "bitcoin_block": ots_meta.get("bitcoin_block"),
-            "bitcoin_tx": ots_meta.get("bitcoin_tx"),
-        },
+        detail=detail,
+        extra=extra,
     )
 
 
@@ -1000,14 +1198,221 @@ def check_tls_evidence(zf: zipfile.ZipFile) -> CheckResult:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Layer 8 — EU Trusted List qualified status (offline)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ETSI TS 119 612 namespaces. Certificates inside a TSL service's digital
+# identity are in the *TSL* namespace (02231/v2#), NOT the xmldsig (ds:)
+# namespace — a subtle point that is easy to get wrong and silently match
+# zero certs.
+_TSL_NS = "http://uri.etsi.org/02231/v2#"
+_TSA_QTST = "http://uri.etsi.org/TrstSvc/Svctype/TSA/QTST"
+_SVC_GRANTED = "http://uri.etsi.org/TrstSvc/TrustedList/Svcstatus/granted"
+
+
+def _tsl_xml_candidates(zf: zipfile.ZipFile) -> List[str]:
+    """All bundled Trusted List XML files (e.g. timestamp/tsl/EE.xml)."""
+    out = []
+    for name in zf.namelist():
+        low = name.lower()
+        if low.startswith("timestamp/tsl/") and low.endswith(".xml"):
+            out.append(name)
+    return out
+
+
+def _qualified_tsa_cert_hashes(xml_bytes: bytes) -> Dict[str, str]:
+    """Map sha256(DER) -> service name, for every X509 certificate that
+    belongs to a TSA/QTST service whose status is `granted`.
+
+    Parsed strictly per ETSI TS 119 612 with the correct namespace. We only
+    accept certs whose *owning service* is both type=TSA/QTST and
+    status=granted, so a withdrawn or non-timestamping entry never qualifies.
+    """
+    import base64
+    import xml.etree.ElementTree as ET
+
+    certs: Dict[str, str] = {}
+    root = ET.fromstring(xml_bytes)
+    for svc in root.iter(f"{{{_TSL_NS}}}TSPService"):
+        info = svc.find(f"{{{_TSL_NS}}}ServiceInformation")
+        if info is None:
+            continue
+        stype = info.findtext(f"{{{_TSL_NS}}}ServiceTypeIdentifier", default="")
+        sstatus = info.findtext(f"{{{_TSL_NS}}}ServiceStatus", default="")
+        if stype != _TSA_QTST or sstatus != _SVC_GRANTED:
+            continue
+        name_el = info.find(
+            f"{{{_TSL_NS}}}ServiceName/{{{_TSL_NS}}}Name"
+        )
+        sname = (name_el.text if name_el is not None else "") or "?"
+        # Certificates live under ServiceDigitalIdentity/DigitalId/X509Certificate
+        # in the TSL namespace.
+        for x509 in info.iter(f"{{{_TSL_NS}}}X509Certificate"):
+            b64 = "".join((x509.text or "").split())
+            if not b64:
+                continue
+            try:
+                der = base64.b64decode(b64)
+            except Exception:
+                continue
+            certs[hashlib.sha256(der).hexdigest()] = sname
+    return certs
+
+
+def _token_cert_der_chain(tsr_bytes: bytes) -> List[bytes]:
+    """Return DER bytes of every certificate embedded in the RFC3161 token."""
+    out: List[bytes] = []
+    try:
+        from asn1crypto import tsp, cms, x509 as asn1_x509
+        resp = tsp.TimeStampResp.load(tsr_bytes)
+        token = resp["time_stamp_token"]
+        ci = cms.ContentInfo.load(token.dump())
+        signed_data = ci["content"]
+        certs = signed_data["certificates"]
+        if certs is None:
+            return out
+        for c in certs:
+            obj = c.chosen
+            if isinstance(obj, asn1_x509.Certificate):
+                out.append(obj.dump())
+    except Exception:
+        pass
+    return out
+
+
+def check_tsl_qualified(zf: zipfile.ZipFile, manifest: Dict[str, Any]) -> CheckResult:
+    """Confirm the TSA signer certificate is listed as a *granted*,
+    *qualified* timestamping service (TSA/QTST) in the bundled EU Trusted
+    List — fully offline.
+
+    Layer 4 (eidas_signature) already proves the token was cryptographically
+    signed by the cert embedded in it, and that the cert carries the
+    timeStamping EKU. But that alone does not prove the cert is a *qualified*
+    TSU recognised by an EU member state — a self-issued cert can also carry
+    the timeStamping EKU. This layer closes that gap by checking the signer
+    cert against the official Trusted List shipped in the bundle
+    (timestamp/tsl/<CC>.xml), with no network access.
+
+    What it proves: the timestamp was issued by a TSU that the signer's member
+    state lists as a granted Qualified Time Stamp service — i.e. a genuine
+    eIDAS Article 42 qualified timestamp at the moment the TSL snapshot was
+    taken.
+
+    What it does NOT prove on its own: that the TSL snapshot itself is the
+    authentic, signature-valid LOTL-anchored list (the bundle ships the member
+    state TSL; full LOTL-signature validation against the EU list-of-lists is
+    a heavier, separate step). It also reflects status as of the bundled TSL,
+    not necessarily today's status.
+    """
+    tsr_bytes = _read_zip_file(zf, "timestamp/eidas.tsr")
+    if tsr_bytes is None:
+        return CheckResult(
+            name="tsl_qualified", passed=True, skipped=True,
+            detail="no eIDAS token in bundle",
+        )
+
+    tsl_files = _tsl_xml_candidates(zf)
+    if not tsl_files:
+        # No bundled TSL — cannot validate offline. Skip rather than fail:
+        # older bundles (evidence-1/2/3) may predate per-country TSL bundling.
+        return CheckResult(
+            name="tsl_qualified", passed=True, skipped=True,
+            detail="no Trusted List bundled (timestamp/tsl/*.xml absent)",
+        )
+
+    chain = _token_cert_der_chain(tsr_bytes)
+    if not chain:
+        return CheckResult(
+            name="tsl_qualified", passed=False,
+            detail="could not extract any certificate from the RFC3161 token",
+        )
+    chain_hashes = {hashlib.sha256(d).hexdigest(): d for d in chain}
+
+    # Aggregate qualified-TSA certs across all bundled member-state TSLs.
+    all_qualified: Dict[str, str] = {}
+    parsed_files = []
+    for fname in tsl_files:
+        raw = _read_zip_file(zf, fname)
+        if raw is None:
+            continue
+        try:
+            q = _qualified_tsa_cert_hashes(raw)
+        except Exception as exc:
+            return CheckResult(
+                name="tsl_qualified", passed=False,
+                detail=f"failed to parse {fname}: {type(exc).__name__}: {exc}",
+            )
+        all_qualified.update(q)
+        parsed_files.append(fname)
+
+    # The signer cert is conventionally the first cert; but to be robust we
+    # accept a match on ANY cert in the token chain (some TSLs list the issuing
+    # CA's TSU cert). The signer leaf is chain[0].
+    signer_sha = hashlib.sha256(chain[0]).hexdigest()
+    matched_sha = None
+    matched_name = None
+    if signer_sha in all_qualified:
+        matched_sha, matched_name = signer_sha, all_qualified[signer_sha]
+    else:
+        for h in chain_hashes:
+            if h in all_qualified:
+                matched_sha, matched_name = h, all_qualified[h]
+                break
+
+    if matched_sha is None:
+        return CheckResult(
+            name="tsl_qualified", passed=False,
+            detail=(
+                "TSA signer cert NOT found among granted TSA/QTST services in "
+                f"bundled Trusted List(s) {parsed_files}"
+            ),
+            extra={
+                "signer_sha256": signer_sha,
+                "qualified_certs_in_tsl": len(all_qualified),
+                "tsl_files": parsed_files,
+            },
+        )
+
+    on_leaf = matched_sha == signer_sha
+    return CheckResult(
+        name="tsl_qualified", passed=True,
+        detail=(
+            f"signer cert listed as granted Qualified TSA in EU Trusted List "
+            f"({matched_name})"
+            + ("" if on_leaf else " [matched via chain cert, not leaf]")
+        ),
+        extra={
+            "signer_sha256": signer_sha,
+            "matched_sha256": matched_sha,
+            "matched_on_leaf": on_leaf,
+            "service_name": matched_name,
+            "service_type": "TSA/QTST",
+            "service_status": "granted",
+            "qualified_certs_in_tsl": len(all_qualified),
+            "tsl_files": parsed_files,
+        },
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Public entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
-def verify_evidence_zip(zip_bytes: bytes) -> VerifyReport:
+def verify_evidence_zip(
+    zip_bytes: bytes,
+    *,
+    bitcoin_rpc: Optional[str] = None,
+) -> VerifyReport:
     """Run all verification layers on an evidence ZIP and return a report.
 
-    This is a pure function: same input → same report. No network calls,
-    no side effects, no GetProofAnchor servers.
+    By default this is a pure offline function: same input → same report, no
+    network calls, no GetProofAnchor servers.
+
+    If `bitcoin_rpc` is given (a Bitcoin Core JSON-RPC URL the caller
+    operates, e.g. "http://user:pass@127.0.0.1:8332"), the OTS layer
+    additionally performs REAL Bitcoin block verification against that node —
+    the only network call this tool ever makes, and only to the operator's
+    own node. The receipt is never modified.
     """
     report = VerifyReport()
 
@@ -1038,8 +1443,9 @@ def verify_evidence_zip(zip_bytes: bytes) -> VerifyReport:
     report.checks.append(check_cross_references(zf, manifest, proof))
     report.checks.append(check_chain_integrity(zf))
     report.checks.append(check_eidas_signature(zf, manifest))
+    report.checks.append(check_tsl_qualified(zf, manifest))
     report.checks.append(check_anchor_canonical_hash(zf, manifest))
-    report.checks.append(check_ots_receipt(zf, manifest))
+    report.checks.append(check_ots_receipt(zf, manifest, bitcoin_rpc=bitcoin_rpc))
     report.checks.append(check_tls_evidence(zf))
 
     # Build summary
