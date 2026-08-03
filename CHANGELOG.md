@@ -1,5 +1,37 @@
 # Changelog
 
+## [1.5.0] — 2026-08-03
+
+### Security
+
+- **Certified file digests are now verified.** Versions up to 1.4.0 never
+  examined `files_manifest.json` or the preserved bytes under `files/`, so
+  file-digest bundles were reported as VERIFIED even when the certified
+  SHA-256 had been altered or the retained file contents replaced. Because
+  `manifest.json` is not covered by the qualified timestamp, an attacker
+  could recompute it freely and defeat the integrity layer. The new
+  `file_digest` check anchors every comparison on `capture/capture_meta.json`
+  and `content.txt`, which are bound into the eIDAS payload and cannot be
+  edited without breaking the TSA signature.
+
+  Anyone who verified a file-digest bundle with 1.4.0 or earlier should
+  re-run it with 1.5.0.
+
+### Added
+
+- `file_digest` check — cross-verifies each certified file's digest and size
+  against the sealed capture metadata and the sealed content summary, and
+  re-hashes retained file contents against the certified digest.
+- `anchor_witness` check — walks `chain/anchor_witness.jsonl` from the proof's
+  chain entry to the head covered by the OpenTimestamps anchor, so the Bitcoin
+  anchor can be tied to the proof offline. Reported as a skip, not a failure,
+  when the witness is absent: such bundles are internally consistent and their
+  qualified timestamp is unaffected.
+
+### Changed
+
+- Verification now runs 10 layers instead of 8.
+
 ## 1.4.0 (2026-06-11)
 
 ### Added — two new verification capabilities

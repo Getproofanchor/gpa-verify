@@ -1141,6 +1141,251 @@ def check_ots_receipt(
 # Layer 7 — TLS evidence
 # ─────────────────────────────────────────────────────────────────────────────
 
+def check_file_digest(zf: zipfile.ZipFile) -> CheckResult:
+    """Certified file digests must agree across every place they are recorded.
+
+    A file-digest bundle certifies a downloaded or submitted FILE rather than
+    a rendered page. Its principal evidence is the SHA-256 in
+    files_manifest.json — and until this check existed the verifier never
+    looked at it. Two tamperings therefore passed as VERIFIED:
+
+      * altering the digest in files_manifest.json (and recomputing
+        manifest.json, which is not covered by the timestamp), and
+      * replacing the bytes of a retained file under files/ while leaving
+        the certified digest untouched.
+
+    Both are caught here by anchoring every comparison to
+    capture/capture_meta.json and content.txt, which ARE bound into the eIDAS
+    payload and therefore cannot be edited without breaking the TSA signature.
+    """
+    proof = _read_zip_json(zf, "proof.json") or {}
+    capture = proof.get("capture") or {}
+    mode = capture.get("mode") or ""
+    files_manifest = _read_zip_json(zf, "files_manifest.json")
+
+    if mode != "file_digest" and files_manifest is None:
+        return CheckResult(
+            name="file_digest",
+            passed=False,
+            skipped=True,
+            detail="not a file-digest bundle",
+        )
+
+    if files_manifest is None:
+        return CheckResult(
+            name="file_digest",
+            passed=False,
+            detail="capture.mode is file_digest but files_manifest.json is missing",
+        )
+
+    capture_meta = _read_zip_json(zf, "capture/capture_meta.json") or {}
+    sealed_by_name = {
+        f.get("filename"): f
+        for f in (capture_meta.get("files") or [])
+        if isinstance(f, dict)
+    }
+    content_txt = _read_zip_text(zf, "content.txt") or ""
+
+    failures: List[Dict[str, Any]] = []
+    entries = [f for f in (files_manifest.get("files") or []) if isinstance(f, dict)]
+    if not entries:
+        return CheckResult(
+            name="file_digest",
+            passed=False,
+            detail="files_manifest.json lists no files",
+        )
+
+    names = zf.namelist()
+    retained_checked = 0
+
+    for entry in entries:
+        fname = entry.get("filename")
+        fsha = entry.get("sha256")
+        if not fsha:
+            failures.append({"file": fname, "error": "no sha256 in files_manifest.json"})
+            continue
+
+        sealed = sealed_by_name.get(fname)
+        if sealed is None:
+            failures.append({
+                "file": fname,
+                "error": "listed in files_manifest.json but absent from eIDAS-sealed capture_meta.json",
+            })
+        else:
+            if sealed.get("sha256") != fsha:
+                failures.append({
+                    "file": fname,
+                    "error": "digest differs from eIDAS-sealed capture_meta.json",
+                    "sealed": sealed.get("sha256"),
+                    "manifest": fsha,
+                })
+            if sealed.get("size_bytes") != entry.get("size_bytes"):
+                failures.append({
+                    "file": fname,
+                    "error": "size differs from eIDAS-sealed capture_meta.json",
+                    "sealed": sealed.get("size_bytes"),
+                    "manifest": entry.get("size_bytes"),
+                })
+
+        if content_txt and fsha not in content_txt:
+            failures.append({
+                "file": fname,
+                "error": "digest does not appear in the eIDAS-sealed content.txt",
+            })
+
+        if entry.get("retained_in_package"):
+            stored = next(
+                (n for n in names if n.startswith("files/") and n.endswith(str(fname or ""))),
+                None,
+            )
+            if stored is None:
+                failures.append({
+                    "file": fname,
+                    "error": "marked retained_in_package but no file under files/",
+                })
+            else:
+                blob = _read_zip_file(zf, stored)
+                if blob is None:
+                    failures.append({"file": stored, "error": "unreadable"})
+                else:
+                    actual = _sha256(blob)
+                    retained_checked += 1
+                    if actual != fsha:
+                        failures.append({
+                            "file": stored,
+                            "error": "preserved contents do not match the certified digest",
+                            "certified": fsha,
+                            "actual": actual,
+                        })
+
+    if failures:
+        return CheckResult(
+            name="file_digest",
+            passed=False,
+            detail=f"{len(failures)} problem(s) with certified files",
+            extra={"failures": failures},
+        )
+
+    retention = capture_meta.get("retention") or "unknown"
+    detail = f"{len(entries)} certified file(s) consistent with sealed metadata, retention={retention}"
+    if retained_checked:
+        detail += f", {retained_checked} preserved file(s) re-hashed OK"
+    return CheckResult(name="file_digest", passed=True, detail=detail)
+
+
+def check_anchor_witness(zf: zipfile.ZipFile) -> CheckResult:
+    """The proof's chain entry must link to the head the OTS anchor covers.
+
+    One anchor covers a range of chain entries, so the anchored head is
+    usually a later entry than this proof's own. chain/anchor_witness.jsonl
+    bridges the gap with (seq, prev_hash, entry_hash) triples. Without walking
+    it, the Bitcoin anchor cannot be tied to this proof at all — which is most
+    of the reason for having one.
+    """
+    head = _read_zip_json(zf, "chain/chain_head.json")
+    anchor = _read_zip_json(zf, "anchor/anchor_payload.json")
+    if head is None or anchor is None:
+        return CheckResult(
+            name="anchor_witness",
+            passed=False,
+            skipped=True,
+            detail="no chain head or anchor payload in bundle",
+        )
+
+    proof_head = head.get("entry_hash")
+    anchored = anchor.get("head")
+    if not proof_head or not anchored:
+        return CheckResult(
+            name="anchor_witness",
+            passed=False,
+            skipped=True,
+            detail="chain head or anchor head hash missing",
+        )
+
+    if proof_head == anchored:
+        return CheckResult(
+            name="anchor_witness",
+            passed=True,
+            detail=f"proof entry (seq {head.get('seq')}) is itself the anchored head",
+        )
+
+    raw = _read_zip_text(zf, "chain/anchor_witness.jsonl")
+    if raw is None:
+        # Deliberately a skip, not a failure. Nothing here is inconsistent:
+        # the bundle simply cannot demonstrate the link offline, either
+        # because it predates witness support or because the holder removed
+        # the file. Removing it only weakens the holder's own position, so
+        # absence is never an attack — and reporting the whole bundle as
+        # FAILED would tell someone holding an older, perfectly intact
+        # package that their evidence is broken. It is not: the qualified
+        # timestamp and every content hash still verify.
+        return CheckResult(
+            name="anchor_witness",
+            passed=False,
+            skipped=True,
+            detail=(
+                "anchor covers a later chain head (seq "
+                f"{anchor.get('seq')}) than this proof (seq {head.get('seq')}) "
+                "and no chain/anchor_witness.jsonl is present — the Bitcoin "
+                "anchor cannot be linked to this proof from the bundle alone. "
+                "The eIDAS qualified timestamp is unaffected."
+            ),
+            extra={"proof_head": proof_head, "anchored_head": anchored},
+        )
+
+    steps: List[Dict[str, Any]] = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            steps.append(json.loads(line))
+        except Exception:
+            return CheckResult(
+                name="anchor_witness",
+                passed=False,
+                detail="anchor_witness.jsonl contains a malformed line",
+            )
+
+    cursor = proof_head
+    expected_seq = head.get("seq")
+    expected_seq = expected_seq + 1 if isinstance(expected_seq, int) else None
+    for st in steps:
+        if expected_seq is not None and st.get("seq") != expected_seq:
+            return CheckResult(
+                name="anchor_witness",
+                passed=False,
+                detail=f"gap in witness sequence before seq {st.get('seq')}",
+            )
+        if st.get("prev_hash") != cursor:
+            return CheckResult(
+                name="anchor_witness",
+                passed=False,
+                detail=f"broken link at seq {st.get('seq')}",
+                extra={"expected_prev": cursor, "actual_prev": st.get("prev_hash")},
+            )
+        cursor = st.get("entry_hash")
+        if expected_seq is not None:
+            expected_seq += 1
+
+    if cursor != anchored:
+        return CheckResult(
+            name="anchor_witness",
+            passed=False,
+            detail="witness does not terminate at the anchored head",
+            extra={"reached": cursor, "anchored_head": anchored},
+        )
+
+    return CheckResult(
+        name="anchor_witness",
+        passed=True,
+        detail=(
+            f"{len(steps)} witness entries link this proof (seq {head.get('seq')}) "
+            f"to the anchored head (seq {anchor.get('seq')})"
+        ),
+    )
+
+
 def check_tls_evidence(zf: zipfile.ZipFile) -> CheckResult:
     """TLS leaf cert SHA-256 fingerprint must match network/tls.json claim,
     and the chain must include the leaf."""
@@ -1446,6 +1691,8 @@ def verify_evidence_zip(
     report.checks.append(check_tsl_qualified(zf, manifest))
     report.checks.append(check_anchor_canonical_hash(zf, manifest))
     report.checks.append(check_ots_receipt(zf, manifest, bitcoin_rpc=bitcoin_rpc))
+    report.checks.append(check_file_digest(zf))
+    report.checks.append(check_anchor_witness(zf))
     report.checks.append(check_tls_evidence(zf))
 
     # Build summary

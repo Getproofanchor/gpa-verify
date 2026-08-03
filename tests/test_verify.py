@@ -59,9 +59,9 @@ def test_pristine_bundle_verifies(fixture_zip: bytes):
 
 
 def test_check_count(fixture_zip: bytes):
-    """All 8 verification layers must run."""
+    """All 10 verification layers must run."""
     report = verify_evidence_zip(fixture_zip)
-    assert report.summary["checks_total"] == 8
+    assert report.summary["checks_total"] == 10
     expected_layers = {
         "bundle_integrity",
         "cross_references",
@@ -70,6 +70,8 @@ def test_check_count(fixture_zip: bytes):
         "tsl_qualified",
         "anchor_canonical_hash",
         "ots_receipt",
+        "file_digest",
+        "anchor_witness",
         "tls_evidence",
     }
     actual = {c.name for c in report.checks}
@@ -150,7 +152,14 @@ def _modify_zip_file(orig: bytes, target: str, modify_fn) -> bytes:
 
 
 def test_tamper_screenshot_one_byte_detected(fixture_zip: bytes):
-    """Flipping a single byte in screenshot.png must be detected."""
+    """Flipping a single byte in screenshot.png must be detected.
+
+    File-digest bundles certify a file rather than a rendered page and
+    carry no screenshot, so there is nothing to corrupt — the bundle would
+    stay pristine and correctly verify.
+    """
+    if not _zip_has(fixture_zip, "screenshot.png"):
+        pytest.skip("bundle has no screenshot (file-digest capture)")
     tampered = _modify_zip_file(
         fixture_zip,
         "screenshot.png",
