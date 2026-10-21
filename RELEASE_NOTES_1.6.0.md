@@ -1,4 +1,4 @@
-# gpa-verify 1.6.0 — Anchor v3 inclusion proofs, honest anchor witness, timestamp hardening
+# gpa-verify 1.6.0 — Forensic Browser outputs, anchor v3 inclusion proofs, timestamp hardening
 
 **This is a security release. Upgrade if you verify GetProofAnchor bundles.**
 
@@ -84,3 +84,27 @@ its own EU Trusted List cache) or against the official EU list.
 ## Upgrade
 
     pip install --upgrade gpa-verify
+
+## New: Forensic Browser outputs
+
+`gpa-verify <file>` now auto-detects and verifies the outputs of the
+GetProofAnchor **Forensic Browser** desktop app:
+
+- **ZIP packages** (`getproofanchor-lite-2`): every file against `manifest.json`,
+  every sealed file against the time-stamped `eidas_payload.json`, per-page
+  hashes, the RFC 3161 token, the TSA certificate chain and the qualified
+  status from the EU Trusted List snapshot inside the package.
+- **Sealed PDFs (PAdES document timestamp):** the signed byte range covers the
+  whole file, the token matches it, embedded attachments match the embedded
+  manifest. Bytes appended after sealing are accepted only if they are LTV data
+  or another document timestamp; anything else is reported as
+  **MODIFIED AFTER SEALING**. Sealed PDFs carry no Trusted List: pass
+  `--tsl <file|dir|zip>` to check the qualified status offline.
+- **Unsealed copies (`*_bez-pecete.pdf`):** reported as *not verifiable by
+  itself* (exit code 3). With `--original <sealed.pdf>` the original is fully
+  verified and the copy's identification data (QR code / printed text: session,
+  SHA-256 and size of the sealed file, timestamp serial and time) must match it.
+
+No new dependencies: PDF and QR parsing are implemented in pure Python. See
+`docs/forensic-browser-formats.md`.
+
