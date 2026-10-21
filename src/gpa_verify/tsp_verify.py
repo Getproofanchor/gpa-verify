@@ -635,8 +635,8 @@ def token_checks(
     name_prefix: str = "",
     tsl_missing_detail: str = "no EU Trusted List available offline — qualified status not checked",
 ) -> List[CheckResult]:
-    """Turn a TokenInfo into the standard trio of checks:
-    timestamp_token, tsa_chain, tsl_qualified."""
+    """Turn a TokenInfo into the standard checks:
+    timestamp_token, tsa_chain, tsa_trust_root, tsl_qualified."""
     out: List[CheckResult] = []
     s = info.summary()
     if info.ok:
@@ -657,7 +657,11 @@ def token_checks(
         out.append(CheckResult(name=f"{name_prefix}tsl_qualified", passed=False, skipped=True,
                                detail="no signer certificate"))
         return out
-    ch = build_chain(info.signer_der, list(info.token_cert_ders) + list(pool_ders), info.gen_time)
+    from .trust import KNOWN_INTERMEDIATES, PINNED_ROOTS
+    ch = build_chain(info.signer_der,
+                     list(info.token_cert_ders) + list(pool_ders) + KNOWN_INTERMEDIATES
+                     + [d for _, d in PINNED_ROOTS],
+                     info.gen_time)
     if ch["errors"]:
         out.append(CheckResult(name=f"{name_prefix}tsa_chain", passed=False,
                                detail="; ".join(ch["errors"]), extra={"chain": ch["subjects"]}))
@@ -673,6 +677,9 @@ def token_checks(
             detail=(f"issuer of {_cn(ch['subjects'][-1])} not available offline — chain not "
                     "built (qualified status below is decided by the Trusted List)"),
             extra={"chain": ch["subjects"]}))
+    from .trust import check_trust_root
+    out.append(check_trust_root(info.signer_der, list(info.token_cert_ders) + list(pool_ders),
+                                info.gen_time, name=f"{name_prefix}tsa_trust_root"))
     out.append(check_tsl(ch["ders"], tsl_files, info.gen_time,
                          name=f"{name_prefix}tsl_qualified", missing_detail=tsl_missing_detail))
     return out

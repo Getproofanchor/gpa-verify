@@ -4,6 +4,13 @@
 
 ### Security
 
+- **TSA chain pinned to SK ID Solutions roots** (new check `tsa_trust_root`
+  for SaaS ZIPs, Forensic Browser ZIPs and sealed PDFs). Offline, a self-made
+  TSA plus an edited Trusted List bundled in the evidence passed
+  `tsl_qualified`; now the signer certificate must chain to ROOT G1R, ROOT G1E
+  or EE Certification Centre Root CA (pinned in `gpa_verify.trust`), or to a
+  root given with the new `--trust-root` option. The public intermediate
+  *SK TSA CA 2023R* is bundled for offline chain building of sealed PDFs.
 - **Removing `timestamp/eidas.tsr` no longer yields VERIFIED** (pre-existing
   since ≤ 1.5.0). A bundle that declares a qualified timestamp
   (`proof.json` `eidas.status == "ok"`/`present`, `manifest.json` `eidas`,

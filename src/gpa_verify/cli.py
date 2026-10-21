@@ -155,6 +155,17 @@ def main(argv: list[str] | None = None) -> int:
         help="extra TSA CA certificates (PEM) for building the TSA chain. Repeatable.",
     )
     parser.add_argument(
+        "--trust-root",
+        action="append",
+        metavar="PEM",
+        default=[],
+        help=(
+            "additional root certificate the TSA chain may end in (PEM or DER). "
+            "By default only the SK ID Solutions roots pinned inside gpa-verify "
+            "are trusted. Repeatable."
+        ),
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         help="emit full machine-readable JSON report on stdout",
@@ -202,7 +213,7 @@ def main(argv: list[str] | None = None) -> int:
         if not p.is_file():
             print(f"error: file not found: {p}", file=sys.stderr)
             return 2
-    for p in list(args.tsl) + list(args.certs):
+    for p in list(args.tsl) + list(args.certs) + list(args.trust_root):
         if not Path(p).exists():
             print(f"error: file not found: {p}", file=sys.stderr)
             return 2
@@ -215,6 +226,7 @@ def main(argv: list[str] | None = None) -> int:
             original_name=args.original.name if args.original else None,
             tsl_paths=[str(p) for p in args.tsl],
             cert_paths=[str(p) for p in args.certs],
+            trust_root_paths=[str(p) for p in args.trust_root],
             bitcoin_rpc=args.bitcoin_rpc,
         )
     except OSError as exc:

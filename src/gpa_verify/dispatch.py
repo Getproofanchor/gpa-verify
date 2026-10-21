@@ -60,14 +60,21 @@ def verify_bytes(
     tsl_paths: Optional[List[str]] = None,
     cert_paths: Optional[List[str]] = None,
     bitcoin_rpc: Optional[str] = None,
+    trust_root_paths: Optional[List[str]] = None,
 ) -> Tuple[str, VerifyReport]:
-    """Verify any supported GetProofAnchor output. Returns (kind, report)."""
+    """Verify any supported GetProofAnchor output. Returns (kind, report).
+
+    ``trust_root_paths``: extra root certificates (PEM/DER) the TSA chain may
+    end in, in addition to the roots pinned in gpa_verify.trust."""
     from . import forensic_browser as FB
+    from .trust import extra_roots, load_root_files
 
     kind = detect_kind(data)
     tsl, certs = FB.load_trust_inputs(tsl_paths or [], cert_paths or [])
+    roots = load_root_files(trust_root_paths or [])
     try:
-        rep = _route(kind, data, original, original_name, tsl, certs, bitcoin_rpc)
+        with extra_roots(roots):
+            rep = _route(kind, data, original, original_name, tsl, certs, bitcoin_rpc)
         if not rep.summary:  # core returns an empty summary when the ZIP is unusable
             rep.summary = {"checks_total": len(rep.checks),
                            "checks_passed": sum(1 for c in rep.checks if c.passed),

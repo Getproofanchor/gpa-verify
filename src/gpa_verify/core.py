@@ -1741,6 +1741,34 @@ def check_tsl_qualified(zf: zipfile.ZipFile, manifest: Dict[str, Any]) -> CheckR
     )
 
 
+def check_tsa_trust_root(zf: zipfile.ZipFile, manifest: Dict[str, Any]) -> CheckResult:
+    """1.6.0 — the TSA signer certificate must chain to a root certificate
+    pinned inside gpa-verify (gpa_verify.trust), not merely to whatever root
+    or Trusted List the evidence file itself ships. Without this, an offline
+    verifier could be fooled by a self-made TSA plus a self-made TSL."""
+    from .trust import check_trust_root
+    from .tsp_verify import pem_to_der_list, verify_token
+
+    tsr_bytes = _read_zip_file(zf, "timestamp/eidas.tsr")
+    if tsr_bytes is None:
+        return CheckResult(name="tsa_trust_root", passed=True, skipped=True,
+                           detail="no eIDAS token in bundle")
+    pool: List[bytes] = []
+    for n in zf.namelist():
+        if n.startswith("timestamp/") and n.endswith(".pem"):
+            raw = _read_zip_file(zf, n)
+            if raw:
+                try:
+                    pool.extend(pem_to_der_list(raw))
+                except Exception:
+                    pass
+    info = verify_token(tsr_bytes, None, extra_cert_ders=pool)
+    if not info.signer_der:
+        return CheckResult(name="tsa_trust_root", passed=False,
+                           detail="could not identify the TSA signer certificate in the token")
+    return check_trust_root(info.signer_der, list(info.token_cert_ders) + pool, info.gen_time)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Anchor v3 — Merkle inclusion proof (1.6.0)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2074,6 +2102,7 @@ def verify_evidence_zip(
     report.checks.append(check_chain_integrity(zf))
     report.checks.append(check_eidas_signature(zf, manifest))
     report.checks.append(check_tsl_qualified(zf, manifest))
+    report.checks.append(check_tsa_trust_root(zf, manifest))
     report.checks.append(check_anchor_canonical_hash(zf, manifest))
     report.checks.append(check_ots_receipt(zf, manifest, bitcoin_rpc=bitcoin_rpc))
     report.checks.append(check_file_digest(zf))

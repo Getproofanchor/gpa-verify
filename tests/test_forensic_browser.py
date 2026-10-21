@@ -31,6 +31,7 @@ from gpa_verify.forensic_browser import (
     verify_plain_copy,
     verify_sealed_pdf,
 )
+from gpa_verify.trust import extra_roots
 from gpa_verify.tsp_verify import verify_token
 
 FB = Path(__file__).parent / "fixtures" / "forensic_browser"
@@ -239,7 +240,7 @@ def test_fb_zip_unsealed_metadata_tamper_detected():
 # ═════════════════════════════════════════════════════════════════════════════
 
 class _TSA:
-    def __init__(self, eku_critical=True):
+    def __init__(self, eku_critical=True, root_cn="Test Root", tsu_cn="Test TSU"):
         from cryptography import x509
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.asymmetric import rsa
@@ -248,8 +249,8 @@ class _TSA:
         now = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
         self.root_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         self.key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-        rname = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Test Root")])
-        tname = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Test TSU"),
+        rname = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, root_cn)])
+        tname = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, tsu_cn),
                            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Test TSP")])
         self.root = (x509.CertificateBuilder().subject_name(rname).issuer_name(rname)
                      .public_key(self.root_key.public_key()).serial_number(1)
@@ -261,6 +262,14 @@ class _TSA:
                      .not_valid_before(now).not_valid_after(now + dt.timedelta(days=3650))
                      .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.TIME_STAMPING]), eku_critical)
                      .sign(self.root_key, hashes.SHA256()))
+
+    def root_der(self) -> bytes:
+        from cryptography.hazmat.primitives.serialization import Encoding
+        return self.root.public_bytes(Encoding.DER)
+
+    def cert_der(self) -> bytes:
+        from cryptography.hazmat.primitives.serialization import Encoding
+        return self.cert.public_bytes(Encoding.DER)
 
     def pem(self) -> bytes:
         from cryptography.hazmat.primitives.serialization import Encoding
@@ -349,12 +358,75 @@ def _synthetic_package(n_pages=2, tsa=None) -> bytes:
 
 
 def test_synthetic_multipage_package_verifies():
-    r = verify_fb_zip(_synthetic_package(3))
+    tsa = _TSA()
+    with extra_roots([tsa.root_der()]):          # test CA trusted explicitly
+        r = verify_fb_zip(_synthetic_package(3, tsa=tsa))
     assert not r.any_failed, [(c.name, c.detail, c.extra.get("failures")) for c in r.checks if c.status == "fail"]
     assert _status(r, "pages") == "pass"
     assert "3 page(s)" in next(c for c in r.checks if c.name == "pages").detail
     assert _status(r, "tsa_chain") == "pass"
     assert _status(r, "tsl_qualified") == "skip"   # no TSL bundled
+    assert _status(r, "tsa_trust_root") == "pass"
+
+
+def test_synthetic_package_untrusted_root_fails():
+    """Same package without --trust-root: a self-made TSA must not verify."""
+    r = verify_fb_zip(_synthetic_package(2))
+    assert "tsa_trust_root" in _failed(r)
+    assert r.summary["verdict"] == "FAILED"
+
+
+def test_forged_tsa_with_forged_tsl_is_rejected():
+    """Attack the pinning closes: a self-made CA named like the real SK root,
+    a TSU named like the real one, and the bundled Trusted List edited to
+    list the forged TSU. The TSL check alone is fooled; the pinned root is not."""
+    import base64
+    z = zipfile.ZipFile(io.BytesIO(ZIP.read_bytes()))
+    tsl = z.read("timestamp/tsl/EE.xml")
+    real_pem = [n for n in z.namelist() if n.startswith("timestamp/") and n.endswith(".pem")]
+    from gpa_verify.tsp_verify import pem_to_der_list
+    real_ders = [d for n in real_pem for d in pem_to_der_list(z.read(n))]
+    real_b64 = [base64.b64encode(d) for d in real_ders]
+    hit = next(b for b in real_b64 if b in tsl)          # the real TSU cert listed in EE.xml
+    tsa = _TSA(root_cn="SK ID Solutions ROOT G1R", tsu_cn="SK TIMESTAMPING UNIT 2026R")
+    forged_tsl = tsl.replace(hit, base64.b64encode(tsa.cert_der()))
+    src = _synthetic_package(1, tsa=tsa)
+    r = verify_fb_zip(_rezip(src, add={"timestamp/tsl/EE.xml": forged_tsl}))
+    assert _status(r, "tsl_qualified") == "pass"          # fooled by the forged list …
+    assert "tsa_trust_root" in _failed(r)                 # … but not by the pinned roots
+    assert r.summary["verdict"] == "FAILED"
+
+
+def test_trust_root_cli_option(tmp_path):
+    tsa = _TSA()
+    pkg = tmp_path / "pkg.zip"
+    pkg.write_bytes(_synthetic_package(1, tsa=tsa))
+    root = tmp_path / "root.pem"
+    from cryptography.hazmat.primitives.serialization import Encoding
+    root.write_bytes(tsa.root.public_bytes(Encoding.PEM))
+    assert cli.main([str(pkg), "--quiet"]) == 1
+    assert cli.main([str(pkg), "--quiet", "--trust-root", str(root)]) == 0
+    bad = tmp_path / "bad.pem"
+    bad.write_bytes(b"not a certificate")
+    assert cli.main([str(pkg), "--quiet", "--trust-root", str(bad)]) == 2
+
+
+def test_real_outputs_chain_to_pinned_sk_root():
+    for data in (ZIP.read_bytes(), SEALED.read_bytes()):
+        _, r = verify_bytes(data)
+        c = next(c for c in r.checks if c.name == "tsa_trust_root")
+        assert c.passed and c.extra["trust_root"] == "SK ID Solutions ROOT G1R", c.detail
+    _, r = verify_bytes(SEALED.read_bytes())
+    assert _status(r, "tsa_chain") == "pass"   # bundled SK TSA CA 2023R completes it offline
+
+
+def test_pinned_fingerprints():
+    from gpa_verify.trust import PINNED_FINGERPRINTS
+    assert PINNED_FINGERPRINTS == {
+        "d012da1a62193928c5b4d89d2a72495b1f77ea5d54f23956bc1df2f75528fefb": "SK ID Solutions ROOT G1R",
+        "a272de102a8038f7e100eacfb6db1c930d3cb9f51d76b218de3a4a433bcfd182": "SK ID Solutions ROOT G1E",
+        "3e84ba4342908516e77573c0992f0979ca084e4685681ff195ccba8a229b8a76": "EE Certification Centre Root CA",
+    }
 
 
 def test_synthetic_multipage_missing_page_artifact():

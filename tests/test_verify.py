@@ -59,15 +59,16 @@ def test_pristine_bundle_verifies(fixture_zip: bytes):
 
 
 def test_check_count(fixture_zip: bytes):
-    """All 11 verification layers must run."""
+    """All 12 verification layers must run."""
     report = verify_evidence_zip(fixture_zip)
-    assert report.summary["checks_total"] == 11
+    assert report.summary["checks_total"] == 12
     expected_layers = {
         "bundle_integrity",
         "cross_references",
         "chain_integrity",
         "eidas_signature",
         "tsl_qualified",
+        "tsa_trust_root",
         "anchor_canonical_hash",
         "ots_receipt",
         "file_digest",

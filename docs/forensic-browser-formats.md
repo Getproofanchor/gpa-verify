@@ -171,8 +171,8 @@ screenshot SHA-256 it prints refers to the original PNG in the sealed PDF.
 
 | Format | Checks |
 |---|---|
-| ZIP | `fb_package` (format, session ids agree) · `bundle_integrity` (SHA-256 + size of every file vs manifest, no undeclared files, counts, `payload_sha256`) · `sealed_binding` (every payload hash = file, payload set = manifest sealed set, payload metadata = proof.json, sidecars) · `pages` (per page dir: screenshot/html/mhtml hashes = proof.json and sealed; no stray page dirs) · `timestamp_token` · `tsa_chain` · `tsl_qualified` (bundled TSL, status at genTime) · `timestamp_metadata` (eidas_meta / verification report / qualified_context agree with token and TSL file) · `report_pdf` (report cites session, payload hash, serial) |
-| Sealed PDF | `pdf_structure` · `pades_signature` (ByteRange starts at 0, gap is exactly this dict's `/Contents` hex string, ends at a revision boundary, padding is zeros, field in AcroForm) · `timestamp_token` (imprint = hash of ByteRange data) · `tsa_chain` · `tsl_qualified` (needs `--tsl`) · `post_seal_changes` (later revisions only DSS/VRI/doc-time-stamps, otherwise "MODIFIED AFTER SEALING" with object list and the sealed revision's length + SHA-256) · `attachments` (all embedded files, SHA-256, inside sealed range, vs embedded manifest) · `evidence_consistency` (proof.json ↔ attachments, printed hashes ↔ attachments) |
+| ZIP | `fb_package` (format, session ids agree) · `bundle_integrity` (SHA-256 + size of every file vs manifest, no undeclared files, counts, `payload_sha256`) · `sealed_binding` (every payload hash = file, payload set = manifest sealed set, payload metadata = proof.json, sidecars) · `pages` (per page dir: screenshot/html/mhtml hashes = proof.json and sealed; no stray page dirs) · `timestamp_token` · `tsa_chain` · `tsa_trust_root` (pinned SK roots) · `tsl_qualified` (bundled TSL, status at genTime) · `timestamp_metadata` (eidas_meta / verification report / qualified_context agree with token and TSL file) · `report_pdf` (report cites session, payload hash, serial) |
+| Sealed PDF | `pdf_structure` · `pades_signature` (ByteRange starts at 0, gap is exactly this dict's `/Contents` hex string, ends at a revision boundary, padding is zeros, field in AcroForm) · `timestamp_token` (imprint = hash of ByteRange data) · `tsa_chain` · `tsa_trust_root` · `tsl_qualified` (needs `--tsl`) · `post_seal_changes` (later revisions only DSS/VRI/doc-time-stamps, otherwise "MODIFIED AFTER SEALING" with object list and the sealed revision's length + SHA-256) · `attachments` (all embedded files, SHA-256, inside sealed range, vs embedded manifest) · `evidence_consistency` (proof.json ↔ attachments, printed hashes ↔ attachments) |
 | Plain copy | `copy_identification` (QR via built-in pure-Python QR reader + printed text, must agree) · `copy_integrity` = SKIP → verdict `NOT_VERIFIABLE` (exit 3). With `--original`: all sealed-PDF checks as `original.*` + `copy_binding` (SHA-256, size, session, serial, time) + `copy_content_consistency` (hashes/URLs printed on the copy exist in the original) |
 
 `timestamp_token` (shared by ZIP and PDF) verifies: status granted,
@@ -188,7 +188,9 @@ id-kp-timeStamping and critical, genTime within the TSU validity.
 
 * The Trusted List snapshot is not authenticated (its XMLDSig signature
   and the LOTL pointer are not verified); its SHA-256 is reported. In the
-  ZIP it is unsealed (written after the time-stamp).
+  ZIP it is unsealed (written after the time-stamp). Independently of it,
+  `tsa_trust_root` requires the TSA chain to end in an SK ID Solutions root
+  pinned inside gpa-verify (or a root given with `--trust-root`).
 * No revocation checking (no OCSP/CRL in either container).
 * The plain copy proves nothing by itself; with the original it only proves
   that its *identification data* (and the hashes/URLs it prints) refer to

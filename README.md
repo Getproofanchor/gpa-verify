@@ -140,6 +140,27 @@ reported as *not checked offline* unless you pass `--tsl` (a Trusted List
 `timestamp/tsl/*.xml` and TSA certificates are used). `--certs PEM` adds
 TSA CA certificates for chain building.
 
+### Pinned trust roots (`tsa_trust_root`)
+
+A Trusted List or root certificate shipped *inside* an evidence file comes
+from the same party as the timestamp, so on its own it proves nothing. Every
+input therefore also runs `tsa_trust_root`: the TSA signer certificate must
+chain — every link's signature verified, every certificate valid at genTime —
+to a root key **pinned inside gpa-verify** (`src/gpa_verify/trust.py`):
+
+| Root | SHA-256 (DER) |
+|------|---------------|
+| SK ID Solutions ROOT G1R | `d012da1a62193928c5b4d89d2a72495b1f77ea5d54f23956bc1df2f75528fefb` |
+| SK ID Solutions ROOT G1E | `a272de102a8038f7e100eacfb6db1c930d3cb9f51d76b218de3a4a433bcfd182` |
+| EE Certification Centre Root CA | `3e84ba4342908516e77573c0992f0979ca084e4685681ff195ccba8a229b8a76` |
+
+These are the roots of SK ID Solutions AS, the qualified trust service
+provider whose TSA GetProofAnchor and the Forensic Browser use; compare them
+with <https://c.sk.ee/>. The public intermediate *SK TSA CA 2023R* is bundled
+too, only to complete the chain offline for sealed PDFs (it is not a trust
+anchor). A timestamp from any other TSA fails this check unless you trust its
+root explicitly with `--trust-root root.pem` (repeatable).
+
 The formats are documented in
 [docs/forensic-browser-formats.md](docs/forensic-browser-formats.md).
 The PDF parser and the QR-code reader are small pure-Python modules —
@@ -190,6 +211,12 @@ TSA, and ONLY for our exact payload.
 
 Supported signature algorithms: RSA-PKCS1v15, ECDSA, RSA-PSS (across
 SHA-256, SHA-384, SHA-512 digests).
+
+### TSA trust root (`tsa_trust_root`, 1.6.0)
+
+The signer certificate must chain to a root pinned in gpa-verify (see
+*Pinned trust roots* above). `tsl_qualified` (the bundled EU Trusted List)
+remains an additional check of the TSA's qualified status at genTime.
 
 ### Layer 5 — Anchor canonical hash
 
@@ -260,6 +287,7 @@ verify; see `extra.reasons`), `not_present` (SKIP), `failed` (FAIL).
 | Modify chain entry | Layer 3 |
 | Forge eIDAS payload + update all SHAs | Layer 4 (imprint mismatch) |
 | Substitute eIDAS token from non-TSA cert | Layer 4 (EKU check) |
+| Self-made TSA + edited Trusted List inside the bundle | `tsa_trust_root` (pinned SK roots) |
 | Substitute anchor for a different chain | Layer 5 |
 | Substitute OTS receipt | Layer 6 |
 | Substitute leaf TLS cert | Layer 7 |

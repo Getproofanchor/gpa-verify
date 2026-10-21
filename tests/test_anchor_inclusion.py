@@ -147,9 +147,25 @@ def test_path_tampering_rejected(n):
 
 # ─── server-generated v3 fixtures ───────────────────────────────────────────
 
+def _test_tsa_root(data: bytes) -> bytes:
+    """The v3 fixtures are stamped by a self-signed test TSA (not qualified)."""
+    from gpa_verify.core import _token_cert_der_chain
+    z = zipfile.ZipFile(io.BytesIO(data))
+    return _token_cert_der_chain(z.read("timestamp/eidas.tsr"))[0]
+
+
+def test_v3_fixture_untrusted_tsa_fails_without_trust_root():
+    report = verify_evidence_zip(V3_SAME.read_bytes())
+    assert not _check(report, "tsa_trust_root").passed
+    assert report.summary["verdict"] == "FAILED"
+
+
 @pytest.mark.parametrize("fx", [V3_SAME, V3_LATER], ids=lambda p: p.name)
 def test_v3_fixture_verified(fx):
-    report = verify_evidence_zip(fx.read_bytes())
+    from gpa_verify.trust import extra_roots
+    data = fx.read_bytes()
+    with extra_roots([_test_tsa_root(data)]):
+        report = verify_evidence_zip(data)
     c = _check(report, "anchor_inclusion")
     assert c.passed and not c.skipped, c.detail
     assert c.extra["result"] == "verified" and c.extra["receipt"] == "commits"
