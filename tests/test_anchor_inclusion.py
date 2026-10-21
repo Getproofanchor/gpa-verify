@@ -422,6 +422,7 @@ def test_json_schema_additive():
     d = verify_evidence_zip(V3_SAME.read_bytes()).to_dict()
     assert set(d) == {"proof_id", "bundle_format", "generated_at", "all_passed", "checks", "summary"}
     assert {"checks_total", "checks_passed", "checks_failed", "checks_skipped", "verdict"} <= set(d["summary"])
-    assert [c["name"] for c in d["checks"]][-1] == "anchor_inclusion"
+    # 1.5.0 checks keep their positions; 1.6.0 checks are appended at the end
+    assert [c["name"] for c in d["checks"]][-2:] == ["anchor_inclusion", "tsa_trust_root"]
     for c in d["checks"]:
         assert {"name", "status", "detail"} <= set(c)

@@ -20,7 +20,7 @@ from .core import CheckResult, VerifyReport
 
 def detect_kind(data: bytes) -> str:
     """Return one of: saas_zip, fb_zip, zip_unknown, sealed_pdf, plain_copy,
-    fb_report, pdf_unsigned, unknown."""
+    fb_report, pdf_unsigned, pdf_damaged, unknown."""
     if data[:4] == b"PK\x03\x04" or data[:4] == b"PK\x05\x06":
         try:
             zf = zipfile.ZipFile(io.BytesIO(data))
@@ -30,7 +30,8 @@ def detect_kind(data: bytes) -> str:
 
         def _j(n):
             try:
-                o = json.loads(zf.read(n).decode("utf-8"))
+                from .core import _read_zip_file
+                o = json.loads(_read_zip_file(zf, n).decode("utf-8"))
                 return o if isinstance(o, dict) else None
             except Exception:
                 return None
@@ -46,9 +47,12 @@ def detect_kind(data: bytes) -> str:
             c = classify_pdf(doc)
         except Exception:
             # unparsable: still route by the strongest marker present
-            return "sealed_pdf" if b"/ByteRange" in data else "pdf_unsigned"
-        return {"sealed": "sealed_pdf", "plain_copy": "plain_copy",
-                "fb_report": "fb_report"}.get(c, "pdf_unsigned")
+            return "sealed_pdf" if b"/ByteRange" in data else "pdf_damaged"
+        k = {"sealed": "sealed_pdf", "plain_copy": "plain_copy",
+             "fb_report": "fb_report"}.get(c, "pdf_unsigned")
+        if k == "pdf_unsigned" and (b"/ByteRange" in data or b"ETSI.RFC3161" in data):
+            return "sealed_pdf"   # garbled signature: let the PAdES verifier explain (N5)
+        return k
     return "unknown"
 
 
@@ -109,8 +113,8 @@ def _route(kind, data, original, original_name, tsl, certs, bitcoin_rpc) -> Veri
     rep = VerifyReport(bundle_format="unknown")
     rep.checks.append(CheckResult(
         "input_format", False,
-        detail=("PDF without any signature, time-stamp or GetProofAnchor identification"
-                if kind == "pdf_unsigned" else "not a ZIP or PDF file")))
+        detail={"pdf_unsigned": "PDF without any signature, time-stamp or GetProofAnchor identification",
+                "pdf_damaged": "damaged PDF — the file cannot be parsed"}.get(kind, "not a ZIP or PDF file")))
     rep.summary = {"checks_total": 1, "checks_passed": 0, "checks_failed": 1,
                    "checks_skipped": 0, "verdict": "FAILED"}
     return rep

@@ -65,32 +65,54 @@ Other results:
 - `failed` (FAIL): any inconsistency, including an invalid `proof_id` or
   non-lowercase hex.
 
-## New: pinned TSA trust roots (`tsa_trust_root`)
+## New: pinned TSA trust (`tsa_trust_root`)
 
 Until now, offline, the TSA was judged only by the Trusted List bundled in the
 evidence file — a list supplied by the same party as the timestamp. A forger
 could ship a self-made TSA together with an edited list.
 
 Every SaaS ZIP, Forensic Browser ZIP and sealed PDF now also runs
-`tsa_trust_root`: the TSA signer certificate must chain (every signature
-verified, every certificate valid at genTime) to one of the SK ID Solutions
-roots pinned inside gpa-verify — ROOT G1R, ROOT G1E or EE Certification Centre
-Root CA (SHA-256 fingerprints in the README; compare with https://c.sk.ee/).
-Timestamps from another TSA fail unless its root is passed with
-`--trust-root root.pem`. The public intermediate *SK TSA CA 2023R* is bundled
-so that sealed PDFs (which embed only the TSU certificate) also complete the
-chain offline; `tsa_chain` now passes for them without `--certs`.
+`tsa_trust_root`. The TSA signer certificate must
 
-Remaining limit: revocation (OCSP/CRL) is not checked, and the qualified
-*status* at genTime still comes from the bundled Trusted List (`tsl_qualified`)
-or `--tsl`. The online GetProofAnchor verifier uses its own EU Trusted List
-cache.
+- chain to one of the SK ID Solutions roots pinned inside gpa-verify — ROOT
+  G1R, ROOT G1E or EE Certification Centre Root CA (SHA-256 fingerprints in the
+  README; compare with https://c.sk.ee/) — through CA certificates only, every
+  signature and validity period checked at genTime;
+- be issued directly by the pinned *SK TSA CA 2023R* (or the root itself), so
+  that a certificate issued under SK's ID-card, Smart-ID or e-seal CAs cannot
+  pose as a TSA;
+- carry exactly the critical `id-kp-timeStamping` EKU.
+
+Timestamps from another TSA fail unless its root is passed with
+`--trust-root root.pem`. `tsa_chain` now completes offline for sealed PDFs too.
+
+## Wording: "qualified"
+
+A verdict no longer implies a *qualified* timestamp unless a Trusted List was
+checked. `summary.qualified` is `per_supplied_tsl`, `not_checked` or `failed`;
+the human output prints it under the verdict. The XML signature of a Trusted
+List is not verified: for an independent check pass the official member-state
+list (Estonia: https://sr.riik.ee/tsl/estonian-tsl.xml) with `--tsl`.
+
+## Hardening from the pre-release review
+
+- Sealed PDFs: after the time-stamp only a structurally valid Document
+  Security Store, document time-stamps with invisible widgets and the matching
+  catalog/AcroForm/page `/Annots` changes are accepted.
+- Hostile PDFs and ZIPs are refused within bounded time and memory (limits in
+  the README).
+- Duplicate ZIP member names fail (`zip_structure`).
+
+Remaining limits: no revocation (OCSP/CRL) checking; Trusted List signatures
+are not verified; the online GetProofAnchor verifier uses its own EU Trusted
+List cache.
 
 ## Impact on existing bundles
 
 - Real bundles that verified with 1.5.0 still verify (all are stamped by SK ID
   Solutions and chain to ROOT G1R).
-- SaaS ZIPs now run 12 checks (new `tsa_trust_root`).
+- SaaS ZIPs now run 12 checks; `anchor_inclusion` and `tsa_trust_root` are
+  appended at the end, existing positions are unchanged.
 - Bundles without `anchor/inclusion.json` report `anchor_inclusion` as SKIP.
 - Bundles stripped of a declared qualified timestamp now FAIL; they should.
 - New bundles stay readable by 1.5.0, which gives them the same verdict as

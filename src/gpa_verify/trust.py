@@ -226,6 +226,11 @@ def load_root_files(paths: Iterable[str]) -> List[bytes]:
     return ders
 
 
+def user_roots() -> Tuple[bytes, ...]:
+    """Roots added with --trust-root / extra_roots() for the current run."""
+    return tuple(_EXTRA_ROOTS.get())
+
+
 @contextlib.contextmanager
 def extra_roots(ders: Iterable[bytes]) -> Iterator[None]:
     """Trust additional root certificates for the duration of the block."""
@@ -236,20 +241,55 @@ def extra_roots(ders: Iterable[bytes]) -> Iterator[None]:
         _EXTRA_ROOTS.reset(tok)
 
 
-def _anchors() -> Dict[str, Tuple[str, bytes]]:
-    """sha256(SPKI) -> (label, der). Matching on the public key also accepts a
-    re-issued certificate of the same root key."""
+def _anchors() -> Dict[str, Tuple[str, bytes, bool]]:
+    """sha256(SPKI) -> (label, der, user_supplied). Matching on the public key
+    also accepts a re-issued certificate of the same root key."""
     from cryptography import x509 as cx509
 
-    out: Dict[str, Tuple[str, bytes]] = {}
-    roots = [(n, d) for n, d in PINNED_ROOTS] + [
-        (f"user-supplied root ({hashlib.sha256(d).hexdigest()[:16]}…)", d)
+    out: Dict[str, Tuple[str, bytes, bool]] = {}
+    roots = [(n, d, False) for n, d in PINNED_ROOTS] + [
+        (f"user-supplied root ({hashlib.sha256(d).hexdigest()[:16]}…)", d, True)
         for d in _EXTRA_ROOTS.get()
     ]
-    for name, der in roots:
+    for name, der, user in roots:
         c = cx509.load_der_x509_certificate(der)
-        out[_spki_sha(c)] = (name, der)
+        out[_spki_sha(c)] = (name, der, user)
     return out
+
+
+def _tsa_issuer_spkis() -> Dict[str, str]:
+    """SPKI hashes of the CAs allowed to issue a TSA certificate directly under
+    the pinned SK roots: the SK TSA issuing CA(s), and the roots themselves
+    (SK's older TSA certificates were issued directly by EE Certification
+    Centre Root CA). SK's personal-ID, Smart-ID and e-seal CAs are NOT here —
+    a key certified by them cannot pass as a TSA (review R2)."""
+    from cryptography import x509 as cx509
+
+    out = {}
+    for (name, _fp, _pem), der in zip(_KNOWN_INTERMEDIATES, KNOWN_INTERMEDIATES):
+        out[_spki_sha(cx509.load_der_x509_certificate(der))] = name
+    for name, der in PINNED_ROOTS:
+        out[_spki_sha(cx509.load_der_x509_certificate(der))] = name
+    return out
+
+
+def _leaf_problem(der: bytes) -> Optional[str]:
+    from cryptography import x509 as cx509
+    from cryptography.x509.oid import ExtendedKeyUsageOID
+
+    c = cx509.load_der_x509_certificate(der)
+    try:
+        eku = c.extensions.get_extension_for_class(cx509.ExtendedKeyUsage)
+    except cx509.ExtensionNotFound:
+        return "TSA certificate has no extendedKeyUsage"
+    if not eku.critical or list(eku.value) != [ExtendedKeyUsageOID.TIME_STAMPING]:
+        return "TSA certificate extendedKeyUsage is not exactly id-kp-timeStamping (critical)"
+    try:
+        if c.extensions.get_extension_for_class(cx509.BasicConstraints).value.ca:
+            return "TSA certificate is a CA certificate"
+    except cx509.ExtensionNotFound:
+        pass
+    return None
 
 
 def _spki_sha(cert) -> str:
@@ -267,7 +307,10 @@ def check_trust_root(
     name: str = "tsa_trust_root",
 ) -> CheckResult:
     """PASS only if the TSA signer certificate chains (every link's signature
-    verified, every certificate valid at ``at``) to a pinned root key."""
+    verified, every issuer a CA allowed to sign certificates, every
+    certificate valid at ``at``) to a pinned root key; for the pinned SK roots
+    the signer must moreover be issued by an SK time-stamping CA and carry
+    exactly the critical id-kp-timeStamping EKU."""
     from cryptography import x509 as cx509
 
     from .tsp_verify import build_chain
@@ -276,7 +319,7 @@ def check_trust_root(
         return CheckResult(name=name, passed=False, detail="no TSA signer certificate to check")
     anchors = _anchors()
     # Pinned roots first, so they win over a same-named root shipped in the file.
-    pool = [d for _, d in anchors.values()] + list(pool_ders) + KNOWN_INTERMEDIATES
+    pool = [a[1] for a in anchors.values()] + list(pool_ders) + KNOWN_INTERMEDIATES
     try:
         ch = build_chain(signer_der, pool, at)
     except Exception as exc:
@@ -286,7 +329,7 @@ def check_trust_root(
     for i, der in enumerate(ch["ders"]):
         a = anchors.get(_spki_sha(cx509.load_der_x509_certificate(der)))
         if a is not None:
-            hit = (i, a[0])
+            hit = (i, a[0], a[2])
             break
     extra = {"chain": ch["subjects"], "chain_sha256": ch["sha256"],
              "pinned_roots": sorted(PINNED_FINGERPRINTS.values()),
@@ -304,6 +347,23 @@ def check_trust_root(
            if any(e.startswith(s) for s in ch["subjects"][: hit[0] + 1])]
     if bad:
         return CheckResult(name=name, passed=False, detail="; ".join(bad), extra=extra)
+    leaf_bad = _leaf_problem(ch["ders"][0])
+    if leaf_bad:
+        return CheckResult(name=name, passed=False, detail=leaf_bad, extra=extra)
+    if not hit[2]:  # pinned SK root: the TSA must sit directly under an SK TSA-issuing CA
+        if hit[0] == 0 or len(ch["ders"]) < 2:
+            return CheckResult(name=name, passed=False,
+                               detail="TSA certificate is itself a root certificate", extra=extra)
+        issuer_spki = _spki_sha(cx509.load_der_x509_certificate(ch["ders"][1]))
+        allowed = _tsa_issuer_spkis()
+        if issuer_spki not in allowed:
+            return CheckResult(
+                name=name, passed=False,
+                detail=(f"TSA certificate chains to {hit[1]} but is issued by "
+                        f"{ch['subjects'][1]}, which is not an SK time-stamping CA "
+                        "(only SK TSA CA 2023R or the root itself may issue TSA certificates)"),
+                extra=extra)
+        extra["tsa_issuer"] = allowed[issuer_spki]
     extra["trust_root"] = hit[1]
     return CheckResult(
         name=name, passed=True,

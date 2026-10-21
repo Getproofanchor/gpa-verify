@@ -417,6 +417,27 @@ def _cert_time(cert, attr: str) -> datetime:
 # Chain building
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _may_issue(cert, cas_below: int) -> bool:
+    """RFC 5280 §4.2.1.9 / §4.2.1.3: basicConstraints cA=TRUE, keyUsage (when
+    present) includes keyCertSign, and pathLenConstraint >= number of
+    non-leaf CA certificates below it."""
+    from cryptography import x509 as cx509
+
+    try:
+        bc = cert.extensions.get_extension_for_class(cx509.BasicConstraints).value
+    except cx509.ExtensionNotFound:
+        return False
+    if not bc.ca:
+        return False
+    if bc.path_length is not None and cas_below > bc.path_length:
+        return False
+    try:
+        ku = cert.extensions.get_extension_for_class(cx509.KeyUsage).value
+    except cx509.ExtensionNotFound:
+        return True
+    return bool(ku.key_cert_sign)
+
+
 def build_chain(signer_der: bytes, pool_ders: Iterable[bytes],
                 at: Optional[datetime] = None) -> Dict[str, Any]:
     """Rebuild issuer chain from the available certs; verify each link."""
@@ -448,6 +469,10 @@ def build_chain(signer_der: bytes, pool_ders: Iterable[bytes],
         issuer = None
         for c in pool:
             if c.subject == cur.issuer and c is not cur:
+                # review R2: an issuer must be a CA allowed to sign certificates
+                # and its pathLenConstraint must admit the CAs below it.
+                if not _may_issue(c, len(chain) - 1):
+                    continue
                 try:
                     cur.verify_directly_issued_by(c)
                     issuer = c
@@ -611,7 +636,8 @@ def check_tsl(
                     return CheckResult(
                         name=name, passed=True,
                         detail=(f"listed as granted Qualified Time-Stamping service at genTime "
-                                f"in {t['territory'] or '?'} Trusted List ({svc['name']})"
+                                f"in the supplied {t['territory'] or '?'} Trusted List ({svc['name']}; "
+                                "list signature not verified)"
                                 + ("" if idx == 0 else " [matched via chain certificate]")),
                         extra=extra,
                     )
@@ -657,10 +683,10 @@ def token_checks(
         out.append(CheckResult(name=f"{name_prefix}tsl_qualified", passed=False, skipped=True,
                                detail="no signer certificate"))
         return out
-    from .trust import KNOWN_INTERMEDIATES, PINNED_ROOTS
+    from .trust import KNOWN_INTERMEDIATES, PINNED_ROOTS, user_roots
     ch = build_chain(info.signer_der,
-                     list(info.token_cert_ders) + list(pool_ders) + KNOWN_INTERMEDIATES
-                     + [d for _, d in PINNED_ROOTS],
+                     [d for _, d in PINNED_ROOTS] + list(user_roots())
+                     + list(info.token_cert_ders) + list(pool_ders) + KNOWN_INTERMEDIATES,
                      info.gen_time)
     if ch["errors"]:
         out.append(CheckResult(name=f"{name_prefix}tsa_chain", passed=False,

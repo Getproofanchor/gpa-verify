@@ -64,16 +64,43 @@ def _finish(report: VerifyReport, verdict: Optional[str] = None,
         verdict = VERDICT_VERIFIED if (not any_failed and any(c.passed for c in checks)) else VERDICT_FAILED
     if any_failed:
         verdict = VERDICT_FAILED
+    q = qualified_status(checks)
+    if q is not None:
+        notes = list(notes or [])
+        root = next((c.extra.get("trust_root") for c in checks
+                     if c.name.endswith("tsa_trust_root") and c.passed), None)
+        if q == "not_checked":
+            notes.insert(0, "Qualified (eIDAS) status NOT checked: the time-stamp is a valid "
+                            "RFC 3161 time-stamp from a TSA chaining to "
+                            f"{root or 'the TSA root'}; supply an EU Trusted List with --tsl "
+                            "to check qualified status.")
+        elif q == "per_supplied_tsl":
+            notes.insert(0, "Qualified status taken from the supplied Trusted List, whose own "
+                            "XML signature is not verified by this tool.")
     report.summary = {
         "checks_total": len(checks),
         "checks_passed": sum(1 for c in checks if c.passed),
         "checks_failed": sum(1 for c in checks if not c.passed and not c.skipped),
         "checks_skipped": sum(1 for c in checks if c.skipped),
         "verdict": verdict,
+        **({"qualified": q} if q is not None else {}),
         **({"notes": notes} if notes else {}),
         **extra,
     }
     return report
+
+
+def qualified_status(checks) -> Optional[str]:
+    """'per_supplied_tsl' | 'not_checked' | 'failed' | None (no time-stamp).
+    Review S1: never call a time-stamp qualified unless a Trusted List said so."""
+    tq = [c for c in checks if c.name.endswith("tsl_qualified")]
+    if not tq:
+        return None
+    if any(not c.passed and not c.skipped for c in tq):
+        return "failed"
+    if all(c.passed and not c.skipped for c in tq):
+        return "per_supplied_tsl"
+    return "not_checked"
 
 
 def _parse_time(s: Any) -> Optional[datetime]:
@@ -149,11 +176,20 @@ def verify_fb_zip(zip_bytes: bytes) -> VerifyReport:
         report.checks.append(CheckResult("zip_open", False, detail=f"not a valid ZIP: {exc}"))
         return _finish(report)
 
+    from .core import MAX_ZIP_ENTRY, zip_structure_problems
+    zprobs = zip_structure_problems(zf)
+    if zprobs:
+        report.checks.append(CheckResult("zip_structure", False, detail="; ".join(zprobs[:5])))
+        return _finish(report)
+
     names = [n for n in zf.namelist() if not n.endswith("/")]
     corrupt: Dict[str, str] = {}
 
     def read(n: str) -> Optional[bytes]:
         try:
+            if zf.getinfo(n).file_size > MAX_ZIP_ENTRY:
+                corrupt[n] = "member exceeds the size limit"
+                return None
             return zf.read(n)
         except KeyError:
             return None
@@ -339,7 +375,7 @@ def verify_fb_zip(zip_bytes: bytes) -> VerifyReport:
         report.checks.append(_check_report_pdf(rp, report.proof_id, info, payload_raw))
 
     notes = [
-        "Files marked sealed=true are bound to the qualified time-stamp through "
+        "Files marked sealed=true are bound to the RFC 3161 time-stamp through "
         "timestamp/eidas_payload.json; a VERIFIED verdict proves they existed in "
         "this exact form at genTime.",
         "Unsealed files (report.pdf, token, certificates, Trusted List snapshot, "
@@ -494,28 +530,40 @@ class _Sig:
         return self.subfilter == "ETSI.RFC3161" or self.type == "DocTimeStamp"
 
 
+MAX_SIGNATURE_DICTS = 64
+_OBJ_HEAD_RE = re.compile(rb"(?<![0-9])(\d+)\s+(\d+)\s+obj\b")
+
+
+class TooManySignatures(Exception):
+    pass
+
+
 def _find_signatures(doc: P.PDFDocument) -> List[_Sig]:
+    import bisect
+
     data = doc.data
     sigs: Dict[int, _Sig] = {}
-    for m in _BR_RE.finditer(data):
-        # find the enclosing indirect object header "N G obj" before it
-        head = None
-        win = 0
-        for win in (65536, 1 << 20, 1 << 24, len(data)):
-            lo = max(0, m.start() - win)
-            for hm in re.finditer(rb"(?<![0-9])(\d+)\s+(\d+)\s+obj\b", data[lo:m.start()]):
-                head = hm
-            if head is not None or lo == 0:
-                break
-        if head is None:
+    # one linear pass over object headers, then bisect per /ByteRange (review R3)
+    heads = [m.start() for m in _OBJ_HEAD_RE.finditer(data)]
+    seen_heads = set()
+    for k, m in enumerate(_BR_RE.finditer(data)):
+        if k >= MAX_SIGNATURE_DICTS * 4:
+            raise TooManySignatures(f"more than {MAX_SIGNATURE_DICTS * 4} /ByteRange entries")
+        i = bisect.bisect_left(heads, m.start()) - 1
+        if i < 0:
             continue
-        off = lo + head.start()
+        off = heads[i]
+        if off in seen_heads:
+            continue
+        seen_heads.add(off)
         try:
             num, gen, obj = P.Parser(data, resolver=doc).parse_indirect_at(off)
         except P.PDFError:
             continue
         if isinstance(obj, dict) and "ByteRange" in obj and "Contents" in obj and off not in sigs:
             sigs[off] = _Sig(num, obj, off)
+            if len(sigs) > MAX_SIGNATURE_DICTS:
+                raise TooManySignatures(f"more than {MAX_SIGNATURE_DICTS} signature dictionaries")
     # mark AcroForm membership
     try:
         af = doc.resolve(doc.root.get("AcroForm")) or {}
@@ -622,30 +670,11 @@ def _analyze_post_seal(doc: P.PDFDocument, sealed_end: int, sigs: List[_Sig]) ->
     changes: List[Dict[str, Any]] = []
     disallowed: List[Dict[str, Any]] = []
 
-    # collect objects referenced from the current DSS (transitively)
-    dss_objs: set = set()
-    root = doc.root
-    dss_ref = root.get("DSS")
-
-    def collect(x: Any, depth: int = 0) -> None:
-        if depth > 12:
-            return
-        if isinstance(x, P.Ref):
-            if x.num in dss_objs:
-                return
-            dss_objs.add(x.num)
-            collect(doc.get_object(x.num), depth + 1)
-        elif isinstance(x, dict):
-            for v in x.values():
-                collect(v, depth + 1)
-        elif isinstance(x, list):
-            for v in x:
-                collect(v, depth + 1)
-        elif isinstance(x, P.Stream):
-            pass
-
-    if dss_ref is not None:
-        collect(dss_ref)
+    # Objects that make up the current Document Security Store. Only the DSS
+    # structure itself is followed (ETSI EN 319 142-1 §5.4.2) — never
+    # arbitrary references (review R1: a DSS pointing at a page made a forged
+    # page "permitted").
+    dss_struct, dss_streams, dss_problems = _collect_dss(doc, doc.root.get("DSS"))
 
     later_sig_nums = {s.num for s in sigs if s.end > sealed_end and s.num is not None}
     root_num = doc.trailer.get("Root").num if isinstance(doc.trailer.get("Root"), P.Ref) else None
@@ -673,14 +702,16 @@ def _analyze_post_seal(doc: P.PDFDocument, sealed_end: int, sigs: List[_Sig]) ->
                 except P.PDFError:
                     obj = None
             is_new = prev is None or prev[0] == "f"
-            reason = _classify_change(doc, num, obj, prev, is_new, dss_objs, later_sig_nums,
-                                      root_num, info_num, sealed_entries)
+            reason = _classify_change(doc, num, obj, prev, is_new, dss_struct, dss_streams,
+                                      later_sig_nums, root_num, info_num, sealed_entries)
             rec = {"object": num, "new": is_new, "revision_xref": sec.offset, "classified": reason[1]}
             changes.append(rec)
             if not reason[0]:
                 disallowed.append(rec)
 
     extra = {"revisions_after": len(later), "changed_objects": changes[:50]}
+    if dss_problems and changes:
+        disallowed.append({"object": None, "classified": "invalid DSS: " + "; ".join(dss_problems[:3])})
     if disallowed:
         return False, (f"MODIFIED AFTER SEALING: {len(disallowed)} object change(s) in "
                        f"{len(later)} later revision(s) are not LTV/time-stamp updates "
@@ -693,61 +724,207 @@ def _analyze_post_seal(doc: P.PDFDocument, sealed_end: int, sigs: List[_Sig]) ->
                   f"time-stamp updates ({', '.join(kinds)})"), extra
 
 
-def _classify_change(doc, num, obj, prev, is_new, dss_objs, later_sig_nums, root_num,
-                     info_num, sealed_entries) -> Tuple[bool, str]:
+_DSS_KEYS = {"Type", "Certs", "CRLs", "OCSPs", "VRI"}
+_VRI_ENTRY_KEYS = {"Type", "Cert", "CRL", "OCSP", "TU", "TS"}
+
+
+def _collect_dss(doc, dss_ref) -> Tuple[set, set, List[str]]:
+    """Return (structural object numbers, data stream numbers, problems) of the
+    DSS. Structure: DSS dict → Certs/CRLs/OCSPs arrays of stream refs, VRI dict
+    → per-signature dicts with Cert/CRL/OCSP arrays of stream refs and TS
+    stream. Anything else is reported as a problem."""
+    struct: set = set()
+    streams: set = set()
+    probs: List[str] = []
+    if dss_ref is None:
+        return struct, streams, probs
+
+    def take(x, what):
+        if isinstance(x, P.Ref):
+            struct.add(x.num)
+            return doc.get_object(x.num)
+        return x
+
+    def stream_ref(x, where):
+        if not isinstance(x, P.Ref):
+            probs.append(f"{where}: entry is not an indirect stream")
+            return
+        o = doc.get_object(x.num)
+        if not isinstance(o, P.Stream) or o.get("Type") in ("XObject", "ObjStm", "XRef", "Metadata"):
+            probs.append(f"{where}: object {x.num} is not a certificate/CRL/OCSP stream")
+            return
+        streams.add(x.num)
+
+    def stream_array(x, where):
+        arr = take(x, where)
+        if not isinstance(arr, list):
+            probs.append(f"{where} is not an array")
+            return
+        if len(arr) > 10000:
+            probs.append(f"{where} too long")
+            return
+        for e in arr:
+            stream_ref(e, where)
+
+    dss = take(dss_ref, "DSS")
+    if not isinstance(dss, dict):
+        return struct, streams, ["/DSS is not a dictionary"]
+    if set(dss) - _DSS_KEYS:
+        probs.append("DSS has unexpected keys " + ",".join(sorted(set(dss) - _DSS_KEYS)))
+    for k in ("Certs", "CRLs", "OCSPs"):
+        if k in dss:
+            stream_array(dss[k], f"DSS/{k}")
+    if "VRI" in dss:
+        vri = take(dss["VRI"], "VRI")
+        if not isinstance(vri, dict) or len(vri) > 10000:
+            probs.append("DSS/VRI is not a dictionary")
+        else:
+            for key, ent in vri.items():
+                if key == "Type":
+                    continue
+                d = take(ent, "VRI entry")
+                if not isinstance(d, dict):
+                    probs.append("VRI entry is not a dictionary")
+                    continue
+                if set(d) - _VRI_ENTRY_KEYS:
+                    probs.append("VRI entry has unexpected keys " + ",".join(sorted(set(d) - _VRI_ENTRY_KEYS)))
+                for k in ("Cert", "CRL", "OCSP"):
+                    if k in d:
+                        stream_array(d[k], f"VRI/{k}")
+                if "TS" in d:
+                    stream_ref(d["TS"], "VRI/TS")
+    return struct, streams, probs
+
+
+def _old_object(doc, num, prev, sealed_entries):
+    if prev is None or prev[0] == "f":
+        return None
+    try:
+        if prev[0] == "n":
+            _, _, old = P.Parser(doc.data, resolver=doc).parse_indirect_at(prev[1])
+            return old
+        return doc.get_object(num, entries=sealed_entries)
+    except P.PDFError:
+        return None
+
+
+def _zero_rect(r) -> bool:
+    return (isinstance(r, list) and len(r) == 4 and all(isinstance(v, (int, float)) for v in r)
+            and (r[2] - r[0]) == 0 and (r[3] - r[1]) == 0)
+
+
+def _classify_change(doc, num, obj, prev, is_new, dss_struct, dss_streams, later_sig_nums,
+                     root_num, info_num, sealed_entries) -> Tuple[bool, str]:
+    """Rules (review R1): a sealed object may change only in the few ways an
+    LTV / document time-stamp writer needs; new objects are allowed only as
+    DSS structure/data, xref/object streams, or a new document time-stamp
+    (signature dict + invisible widget)."""
     if isinstance(obj, P.Stream):
         t = obj.get("Type")
         if t == "XRef":
             return True, "xref stream"
         if t == "ObjStm":
             return True, "object stream"
-        if num in dss_objs and is_new:
+        if num in dss_streams and is_new:
             return True, "DSS data (certificate/CRL/OCSP)"
+        if num in dss_streams:
+            return False, "sealed stream rewritten and referenced from DSS"
         if t == "Metadata":
             return False, "XMP metadata changed"
         return False, "new or changed content stream"
+    old = _old_object(doc, num, prev, sealed_entries)
+    t = obj.get("Type") if isinstance(obj, dict) else None
+
+    if num in dss_struct:
+        if is_new:
+            return True, "DSS / VRI"
+        # a sealed object may only be "rewritten" as DSS if it was the DSS before
+        sealed_root = None
+        if root_num is not None:
+            sealed_root = _old_object(doc, root_num, sealed_entries.get(root_num), sealed_entries)
+        was_dss = (isinstance(old, dict) and old.get("Type") == "DSS") or (
+            isinstance(sealed_root, dict) and isinstance(sealed_root.get("DSS"), P.Ref)
+            and sealed_root["DSS"].num == num)
+        return (True, "DSS updated") if was_dss else (False, "sealed object reused as DSS structure")
+
     if not isinstance(obj, dict):
-        if num in dss_objs:
-            return True, "DSS array"
         return False, "non-dictionary object changed"
-    t = obj.get("Type")
-    if t == "DSS" or num in dss_objs:
-        return True, "DSS / VRI"
-    if num in later_sig_nums or t == "DocTimeStamp":
-        return (True, "document time-stamp") if obj.get("SubFilter") == "ETSI.RFC3161" else (False, "new signature (not a document time-stamp)")
-    if obj.get("FT") == "Sig" and isinstance(obj.get("V"), P.Ref) and obj["V"].num in later_sig_nums:
-        return True, "time-stamp field"
-    old = None
-    if prev is not None and prev[0] == "n":
-        try:
-            _, _, old = P.Parser(doc.data, resolver=doc).parse_indirect_at(prev[1])
-        except P.PDFError:
-            old = None
+
+    if t == "DocTimeStamp" or num in later_sig_nums:
+        if not is_new:
+            return False, "sealed object turned into a signature dictionary"
+        return (True, "document time-stamp") if obj.get("SubFilter") == "ETSI.RFC3161" \
+            else (False, "new signature (not a document time-stamp)")
+    if is_new and _is_ts_widget_obj(obj, later_sig_nums):
+        if "Rect" in obj and not _zero_rect(obj.get("Rect")):
+            return False, "visible time-stamp widget"
+        return True, "time-stamp field (invisible)"
+
     if not isinstance(old, dict):
         return False, "new object of unknown purpose" if is_new else "changed object"
     diff = {k for k in set(old) | set(obj) if old.get(k) != obj.get(k)}
+    if not diff:
+        return True, "rewritten (identical)"
     if num == root_num or t == "Catalog":
         bad = diff - {"DSS", "AcroForm", "Extensions"}
-        return (not bad, "catalog: " + ",".join(sorted(diff)) if not bad else "catalog changed: " + ",".join(sorted(bad)))
+        if bad:
+            return False, "catalog changed: " + ",".join(sorted(bad))
+        if "AcroForm" in diff and not (isinstance(old.get("AcroForm"), P.Ref)
+                                       and old.get("AcroForm") == obj.get("AcroForm")):
+            ok, why = _acroform_ok(doc, doc.resolve(old.get("AcroForm")),
+                                   doc.resolve(obj.get("AcroForm")), later_sig_nums)
+            if not ok:
+                return False, "catalog AcroForm: " + why
+        return True, "catalog: " + ",".join(sorted(diff))
     if num == info_num:
         bad = diff - {"Producer", "ModDate"}
         return (not bad, "document info (Producer/ModDate)" if not bad else "document info changed: " + ",".join(sorted(bad)))
     if t == "Page" or "Annots" in diff:
         if diff == {"Annots"}:
-            old_a = set(r.num for r in (old.get("Annots") or []) if isinstance(r, P.Ref)) if isinstance(old.get("Annots"), list) else set()
-            new_a = set(r.num for r in (obj.get("Annots") or []) if isinstance(r, P.Ref)) if isinstance(obj.get("Annots"), list) else set()
-            added = new_a - old_a
-            if old_a <= new_a and all(_is_ts_widget(doc, n, later_sig_nums) for n in added):
+            old_a = _ref_nums(doc, old.get("Annots"))
+            new_a = _ref_nums(doc, obj.get("Annots"))
+            if old_a is not None and new_a is not None and old_a <= new_a and \
+                    all(_is_ts_widget(doc, n, later_sig_nums) for n in new_a - old_a):
                 return True, "page: time-stamp widget added"
         return False, "page changed: " + ",".join(sorted(diff))
-    if "Fields" in diff and diff <= {"Fields", "SigFlags"}:
-        return True, "AcroForm fields (time-stamp)"
-    return False, "changed object: " + ",".join(sorted(diff)) if diff else "rewritten (identical)"
+    if t == "AcroForm" or "Fields" in diff:
+        ok, why = _acroform_ok(doc, old, obj, later_sig_nums)
+        return (True, "AcroForm fields (time-stamp)") if ok else (False, "AcroForm changed: " + why)
+    return False, "changed object: " + ",".join(sorted(diff))
+
+
+def _ref_nums(doc, x) -> Optional[set]:
+    x = doc.resolve(x) if isinstance(x, P.Ref) else x
+    if x is None:
+        return set()
+    if not isinstance(x, list):
+        return None
+    return {r.num for r in x if isinstance(r, P.Ref)}
+
+
+def _acroform_ok(doc, old, new, later_sig_nums) -> Tuple[bool, str]:
+    if not isinstance(new, dict):
+        return False, "not a dictionary"
+    if not isinstance(old, dict):
+        old = {}
+    diff = {k for k in set(old) | set(new) if old.get(k) != new.get(k)}
+    if diff - {"Fields", "SigFlags"}:
+        return False, ",".join(sorted(diff - {"Fields", "SigFlags"}))
+    of, nf = _ref_nums(doc, old.get("Fields")), _ref_nums(doc, new.get("Fields"))
+    if of is None or nf is None or not of <= nf:
+        return False, "existing fields removed or replaced"
+    if not all(_is_ts_widget(doc, n, later_sig_nums) for n in nf - of):
+        return False, "added field is not a document time-stamp"
+    return True, "fields appended"
+
+
+def _is_ts_widget_obj(o, later_sig_nums) -> bool:
+    return isinstance(o, dict) and o.get("FT") == "Sig" and isinstance(o.get("V"), P.Ref) \
+        and o["V"].num in later_sig_nums
 
 
 def _is_ts_widget(doc, n, later_sig_nums) -> bool:
-    o = doc.get_object(n)
-    return isinstance(o, dict) and o.get("FT") == "Sig" and isinstance(o.get("V"), P.Ref) and o["V"].num in later_sig_nums
+    return _is_ts_widget_obj(doc.get_object(n), later_sig_nums)
 
 
 def _name_text(x: Any) -> Optional[str]:
@@ -859,7 +1036,11 @@ def verify_sealed_pdf(pdf_bytes: bytes, *, tsl_files: Optional[List[Tuple[str, b
                               "xref": r.xref.kind if r.xref else None} for r in revs],
                "warnings": doc.warnings},
     ))
-    sigs = _find_signatures(doc)
+    try:
+        sigs = _find_signatures(doc)
+    except TooManySignatures as exc:
+        report.checks.append(CheckResult("pades_signature", False, detail=f"refused: {exc}"))
+        return _finish(report)
     if not sigs:
         report.checks.append(CheckResult("pades_signature", False, detail="no signature dictionary with /ByteRange found"))
         return _finish(report)
@@ -994,13 +1175,10 @@ def _verify_sealed_tail(doc, report, primary, primary_info, sigs, sig_summ, tsl_
         report.proof_id = m.group(0) if m else None
 
     notes = [
-        "The qualified document time-stamp covers every byte of the PDF except its own "
+        "The document time-stamp covers every byte of the PDF except its own "
         "/Contents value — including all embedded artefacts — so a VERIFIED verdict proves "
         "the document and its attachments existed in this exact form at genTime.",
     ]
-    if not tsl_files:
-        notes.append("EU Trusted List not supplied: the TSA's qualified status was not checked "
-                     "(use --tsl). The time-stamp signature itself was verified.")
     return _finish(report, notes=notes,
                    timestamp=primary_info.summary() if primary_info else None,
                    signatures=sig_summ,

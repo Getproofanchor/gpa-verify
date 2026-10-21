@@ -166,11 +166,43 @@ def _canonical_json_bytes(obj: Any) -> bytes:
     ).encode("utf-8")
 
 
+# Resource limits for hostile ZIPs (review R3). Real bundles are far below.
+MAX_ZIP_ENTRY = 1 << 30        # 1 GiB uncompressed per member
+MAX_ZIP_TOTAL = 4 << 30        # 4 GiB uncompressed in total
+MAX_ZIP_RATIO = 1000           # compression ratio for members above 16 MiB
+MAX_ZIP_MEMBERS = 100000
+
+
+def zip_structure_problems(zf: zipfile.ZipFile) -> List[str]:
+    """Duplicate member names and size/ratio limits — checked before reading."""
+    probs: List[str] = []
+    infos = zf.infolist()
+    if len(infos) > MAX_ZIP_MEMBERS:
+        return [f"more than {MAX_ZIP_MEMBERS} members"]
+    seen: set = set()
+    dups = sorted({i.filename for i in infos if i.filename in seen or seen.add(i.filename)})
+    if dups:
+        probs.append("duplicate member name(s): " + ", ".join(dups[:5]))
+    total = 0
+    for i in infos:
+        total += i.file_size
+        if i.file_size > MAX_ZIP_ENTRY:
+            probs.append(f"{i.filename}: {i.file_size} bytes uncompressed exceeds the limit")
+        elif i.file_size > (16 << 20) and i.file_size > MAX_ZIP_RATIO * max(1, i.compress_size):
+            probs.append(f"{i.filename}: compression ratio above {MAX_ZIP_RATIO}:1 (zip bomb)")
+    if total > MAX_ZIP_TOTAL:
+        probs.append(f"total uncompressed size {total} bytes exceeds the limit")
+    return probs
+
+
 def _read_zip_file(zf: zipfile.ZipFile, name: str) -> Optional[bytes]:
     try:
-        return zf.read(name)
+        info = zf.getinfo(name)
     except KeyError:
         return None
+    if info.file_size > MAX_ZIP_ENTRY:
+        return None
+    return zf.read(info)
 
 
 def _read_zip_json(zf: zipfile.ZipFile, name: str) -> Optional[Dict[str, Any]]:
@@ -765,7 +797,12 @@ def check_eidas_signature(
             except Exception:
                 pass
         if signer_cert_der is None:
-            signer_cert_der = certs[0].chosen.dump()
+            # review R2/S5: never fall back to an arbitrary certificate
+            return CheckResult(
+                name="eidas_signature",
+                passed=False,
+                detail="no certificate in the token matches the SignerInfo identifier",
+            )
 
         cert = crypto_x509.load_der_x509_certificate(signer_cert_der)
 
@@ -831,6 +868,19 @@ def check_eidas_signature(
                 name="eidas_signature",
                 passed=False,
                 detail="signed messageDigest does not match TSTInfo — token content altered after signing",
+            )
+
+        # Same strict RFC 3161 profile as for Forensic Browser outputs (review
+        # S5): exactly one messageDigest, content-type, ESS signing-certificate
+        # binding, critical id-kp-timeStamping as the only EKU, validity at genTime.
+        from .tsp_verify import verify_token
+        strict = verify_token(tsr_bytes, payload_bytes)
+        if not strict.ok:
+            return CheckResult(
+                name="eidas_signature",
+                passed=False,
+                detail="RFC 3161 token rejected: " + "; ".join(strict.errors[:3]),
+                extra={"errors": strict.errors},
             )
 
         # All passed
@@ -1724,8 +1774,8 @@ def check_tsl_qualified(zf: zipfile.ZipFile, manifest: Dict[str, Any]) -> CheckR
     return CheckResult(
         name="tsl_qualified", passed=True,
         detail=(
-            f"signer cert listed as granted Qualified TSA in EU Trusted List "
-            f"({matched_name})"
+            f"signer cert listed as granted Qualified TSA in the bundled EU Trusted List "
+            f"({matched_name}; list signature not verified)"
             + ("" if on_leaf else " [matched via chain cert, not leaf]")
         ),
         extra={
@@ -2077,6 +2127,13 @@ def verify_evidence_zip(
         ))
         return report
 
+    zprobs = zip_structure_problems(zf)
+    if zprobs:
+        report.checks.append(CheckResult(
+            name="zip_structure", passed=False, detail="; ".join(zprobs[:5]),
+        ))
+        return report
+
     manifest = _read_zip_json(zf, "manifest.json")
     if manifest is None:
         report.checks.append(CheckResult(
@@ -2102,7 +2159,6 @@ def verify_evidence_zip(
     report.checks.append(check_chain_integrity(zf))
     report.checks.append(check_eidas_signature(zf, manifest))
     report.checks.append(check_tsl_qualified(zf, manifest))
-    report.checks.append(check_tsa_trust_root(zf, manifest))
     report.checks.append(check_anchor_canonical_hash(zf, manifest))
     report.checks.append(check_ots_receipt(zf, manifest, bitcoin_rpc=bitcoin_rpc))
     report.checks.append(check_file_digest(zf))
@@ -2119,7 +2175,10 @@ def verify_evidence_zip(
             extra={"result": "failed"},
         ))
 
+    report.checks.append(check_tsa_trust_root(zf, manifest))     # 1.6.0 — appended last
+
     # Build summary
+    from .forensic_browser import qualified_status
     report.summary = {
         "checks_total": len(report.checks),
         "checks_passed": sum(1 for c in report.checks if c.passed),
@@ -2134,5 +2193,7 @@ def verify_evidence_zip(
         "anchor_inclusion": next(
             (c.extra.get("result") for c in report.checks if c.name == "anchor_inclusion"), None
         ),
+        # 1.6.0 (additive): per_supplied_tsl / not_checked / failed / None
+        "qualified": qualified_status(report.checks),
     }
     return report

@@ -95,6 +95,12 @@ def _print_human(report: VerifyReport, stream: TextIO, colors: _Colors) -> None:
         f"{s.get('checks_skipped', 0)} skipped)",
         file=stream,
     )
+    q = s.get("qualified")
+    if q and s.get("verdict") == "VERIFIED":
+        label = {"per_supplied_tsl": "qualified per the supplied Trusted List (list signature not verified)",
+                 "not_checked": f"{c.yellow}qualified (eIDAS) status NOT checked{c.reset} — use --tsl",
+                 "failed": "not qualified"}.get(q, q)
+        print(f"  Time-stamp:     {label}", file=stream)
     print(file=stream)
     for note in s.get("notes") or []:
         print(f"  {c.dim}• {note}{c.reset}", file=stream)
@@ -233,6 +239,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     not_verifiable = report.summary.get("verdict") == "NOT_VERIFIABLE"
+    if args.original and _kind not in ("plain_copy", "fb_report"):
+        print(f"warning: --original is ignored for this input ({_kind})", file=sys.stderr)
+    if args.bitcoin_rpc and _kind not in ("saas_zip", "zip_unknown"):
+        print(f"warning: --bitcoin-rpc is ignored for this input ({_kind})", file=sys.stderr)
 
     if args.json:
         json.dump(report.to_dict(), sys.stdout, indent=2, ensure_ascii=False)

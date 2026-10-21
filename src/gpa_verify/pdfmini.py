@@ -337,9 +337,33 @@ class Parser:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+# Resource limits for hostile input (review R3). A real GetProofAnchor PDF
+# decodes to a few MB; these leave ample headroom.
+MAX_STREAM_DECODED = 64 << 20      # bytes per decoded stream
+MAX_DOC_DECODED = 256 << 20        # bytes decoded per document (all streams)
+MAX_PREDICTOR_INPUT = 16 << 20     # PNG/TIFF predictors run in pure Python
+
+
+class LimitExceeded(PDFError):
+    pass
+
+
+def _check_predictor_parms(data: bytes, columns: Any, colors: Any, bpc: Any) -> int:
+    if not (isinstance(columns, int) and isinstance(colors, int) and isinstance(bpc, int)):
+        raise PDFError("predictor parameters must be integers")
+    if not (1 <= colors <= 32 and bpc in (1, 2, 4, 8, 16) and columns >= 1):
+        raise PDFError("invalid predictor parameters")
+    row_len = (columns * colors * bpc + 7) // 8
+    if row_len > len(data) + 1:
+        raise PDFError("predictor /Columns larger than the stream data")
+    if len(data) > MAX_PREDICTOR_INPUT:
+        raise LimitExceeded("predicted stream exceeds the size limit")
+    return row_len
+
+
 def _png_unpredict(data: bytes, columns: int, colors: int, bpc: int) -> bytes:
     bpp = max(1, (colors * bpc + 7) // 8)
-    row_len = (columns * colors * bpc + 7) // 8
+    row_len = _check_predictor_parms(data, columns, colors, bpc)
     out = bytearray()
     prev = bytearray(row_len)
     i = 0
@@ -384,7 +408,7 @@ def _apply_predictor(data: bytes, parms: Optional[Dict[str, Any]]) -> bytes:
     if pred >= 10:
         return _png_unpredict(data, columns, colors, bpc)
     if pred == 2 and bpc == 8:
-        row_len = columns * colors
+        row_len = _check_predictor_parms(data, columns, colors, bpc)
         out = bytearray(data)
         for r in range(0, len(out), row_len):
             for j in range(colors, row_len):
@@ -427,6 +451,17 @@ class UnsupportedFilter(PDFError):
     pass
 
 
+def _inflate(data: bytes, limit: int) -> bytes:
+    d = zlib.decompressobj()
+    try:
+        out = d.decompress(data, limit + 1)
+    except zlib.error as exc:
+        raise PDFError(f"corrupt FlateDecode stream: {exc}") from None
+    if len(out) > limit:
+        raise LimitExceeded(f"FlateDecode stream inflates beyond {limit >> 20} MB")
+    return out
+
+
 def decode_stream(stream: Stream, doc: Optional["PDFDocument"] = None,
                   stop_at: Tuple[str, ...] = ()) -> bytes:
     """Decode a stream's data. Image codecs (DCT, JPX, CCITT, JBIG2) are
@@ -449,13 +484,14 @@ def decode_stream(stream: Stream, doc: Optional["PDFDocument"] = None,
         f = str(r(f))
         p = r(p)
         if f in ("FlateDecode", "Fl"):
-            try:
-                data = zlib.decompress(data)
-            except zlib.error:
-                try:
-                    data = zlib.decompressobj().decompress(data)
-                except zlib.error as exc:
-                    raise PDFError(f"corrupt FlateDecode stream: {exc}") from None
+            limit = MAX_STREAM_DECODED
+            if doc is not None:
+                limit = min(limit, MAX_DOC_DECODED - doc.decoded_bytes)
+                if limit <= 0:
+                    raise LimitExceeded("document decodes to more than the size limit")
+            data = _inflate(data, limit)
+            if doc is not None:
+                doc.decoded_bytes += len(data)
             data = _apply_predictor(data, p if isinstance(p, dict) else None)
         elif f in ("ASCIIHexDecode", "AHx"):
             h = re.sub(rb"[^0-9A-Fa-f]", b"", data.split(b">")[0])
@@ -501,6 +537,7 @@ class Revision:
 class PDFDocument:
     def __init__(self, data: bytes):
         self.data = data
+        self.decoded_bytes = 0
         head = data[:1024]
         hp = head.find(b"%PDF-")
         if hp < 0:
@@ -658,6 +695,11 @@ class PDFDocument:
             raise PDFError("xref stream /W invalid")
         size = stm.get("Size", 0)
         index = stm.get("Index") or [0, size]
+        if not all(isinstance(x, int) and 0 <= x <= 8 for x in w) or sum(w) < 1:
+            raise PDFError("xref stream /W invalid")
+        if not (isinstance(index, list) and len(index) % 2 == 0
+                and all(isinstance(x, int) and x >= 0 for x in index)):
+            raise PDFError("xref stream /Index invalid")
         rowlen = sum(w)
         entries: Dict[int, Tuple[str, int, int]] = {}
         pos = 0
@@ -741,6 +783,8 @@ class PDFDocument:
             data = decode_stream(stm, self)
             n = stm.get("N", 0)
             first = stm.get("First", 0)
+            if not isinstance(n, int) or not isinstance(first, int) or n < 0 or n > len(data) // 2 + 1:
+                raise PDFError(f"object stream {stm_num}: invalid /N")
             lex = Lexer(data)
             pairs = []
             for _ in range(n):

@@ -4,13 +4,31 @@
 
 ### Security
 
-- **TSA chain pinned to SK ID Solutions roots** (new check `tsa_trust_root`
-  for SaaS ZIPs, Forensic Browser ZIPs and sealed PDFs). Offline, a self-made
-  TSA plus an edited Trusted List bundled in the evidence passed
-  `tsl_qualified`; now the signer certificate must chain to ROOT G1R, ROOT G1E
-  or EE Certification Centre Root CA (pinned in `gpa_verify.trust`), or to a
-  root given with the new `--trust-root` option. The public intermediate
-  *SK TSA CA 2023R* is bundled for offline chain building of sealed PDFs.
+- **TSA chain pinned to SK ID Solutions** (new check `tsa_trust_root` for
+  SaaS ZIPs, Forensic Browser ZIPs and sealed PDFs). Offline, a self-made TSA
+  plus an edited Trusted List bundled in the evidence passed `tsl_qualified`.
+  Now the signer certificate must chain to ROOT G1R, ROOT G1E or EE
+  Certification Centre Root CA (pinned in `gpa_verify.trust`) through CA
+  certificates only (basicConstraints, keyUsage keyCertSign,
+  pathLenConstraint — enforced in `build_chain` for every chain), be issued
+  directly by the pinned *SK TSA CA 2023R* (or by the root itself), and carry
+  exactly the critical `id-kp-timeStamping` EKU. A certificate issued under
+  SK's ID-card or e-seal CAs therefore cannot pass as a TSA. Other TSAs:
+  `--trust-root root.pem`.
+- **`eidas_signature` (SaaS) uses the same strict RFC 3161 profile as the
+  Forensic Browser verifier**: no fallback to the first certificate when the
+  SignerInfo matches none, exactly one messageDigest, content-type and ESS
+  signing-certificate binding, exact critical timeStamping EKU.
+- **PAdES post-seal analysis only accepts a genuine Document Security Store**
+  (pre-release review). The DSS is followed only through its defined
+  structure (Certs/CRLs/OCSPs/VRI → streams); a sealed object can no longer be
+  "permitted" by listing it in a DSS, catalog AcroForm swaps and visible
+  time-stamp widgets are rejected.
+- **Resource limits for hostile input**: linear signature scan (≤ 64
+  signature dictionaries), bounded FlateDecode (64 MB per stream, 256 MB per
+  document), validated predictor parameters and xref-stream /W, ZIP member
+  and total size limits, compression-ratio limit, duplicate member names
+  rejected (`zip_structure`).
 - **Removing `timestamp/eidas.tsr` no longer yields VERIFIED** (pre-existing
   since ≤ 1.5.0). A bundle that declares a qualified timestamp
   (`proof.json` `eidas.status == "ok"`/`present`, `manifest.json` `eidas`,
@@ -47,15 +65,17 @@
 - `--bitcoin-rpc` also verifies the **content anchor's** receipt
   (`anchor/inclusion_anchor_receipt.ots` when the proof is in a later anchor
   than the chain anchor); a failed node check fails `anchor_inclusion`.
-- `summary.anchor_inclusion` in the JSON report.
+- `summary.anchor_inclusion` and `summary.qualified` (`per_supplied_tsl` /
+  `not_checked` / `failed`) in the JSON report. Notes and the verdict line no
+  longer call a time-stamp qualified unless a Trusted List was checked.
 - Public helpers `gpa_verify.core.anchor_leaf_v3` and
   `gpa_verify.core.merkle_root_from_path`.
 
 ### Changed
 
-- Verification now runs 11 layers instead of 10. `anchor_inclusion` is
-  appended last, so the positions of the existing checks in `checks[]` are
-  unchanged. The JSON schema only gains fields. `anchor_witness` details gained
+- SaaS ZIPs now run 12 checks instead of 10: `anchor_inclusion` and
+  `tsa_trust_root` are appended at the end, so the positions of the 1.5.0
+  checks in `checks[]` are unchanged. The JSON schema only gains fields. `anchor_witness` details gained
   an "informational (not independently recomputable): " prefix.
 - Hex digests in `anchor/inclusion.json` must be exactly 64 lowercase hex
   characters; invalid `proof_id` values (non-string, > 64 chars, NUL, lone
@@ -71,7 +91,10 @@
   receipt (mocked node); real production bundles with an inclusion proof
   grafted in; the audit's forged-witness PoC; forged TSTInfo; and the
   independent reviewer's 16 adversarial bundles (`tests/fixtures/review/`).
-- `test_check_count` updated to 11 layers.
+- `test_check_count` updated to 12 checks.
+- `tests/test_review_attacks.py`: DSS smuggling, catalog/AcroForm swap,
+  chains through non-CA certificates, pathLen, TSA issued by a non-TSA CA,
+  ByteRange spam, predictor and Flate bombs, duplicate ZIP members, ZIP bombs.
 
 ### Added — Forensic Browser outputs
 
