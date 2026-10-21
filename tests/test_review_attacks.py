@@ -523,3 +523,16 @@ def test_catalog_version_bump_allowed_but_not_down(sealed):
     assert _post_seal(verify_sealed_pdf(_update(data, {3: _ser(root)}))).passed
     root["Version"] = P.Name("1.4")
     assert not _post_seal(verify_sealed_pdf(_update(data, {3: _ser(root)}))).passed
+
+
+def test_many_ltv_renewals_still_verify(sealed):
+    """Round 3b: more than 32 post-seal revisions (decades of renewals)."""
+    data, doc = sealed
+    cur, d = data, doc
+    n = 47
+    for _ in range(40):
+        cur = _dss_rev(cur, d.root, n + 2, n + 1, n)
+        d = P.PDFDocument(cur)
+        n += 3
+    r = _post_seal(verify_sealed_pdf(cur))
+    assert r.passed, r.detail

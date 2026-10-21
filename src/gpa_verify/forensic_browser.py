@@ -639,6 +639,9 @@ def _der_len(b: bytes) -> int:
     return 2 + k + int.from_bytes(b[2:2 + k], "big")
 
 
+MAX_REVISIONS_AFTER_SEAL = 256   # ~ a century of yearly archival renewals
+
+
 def _same(a: Any, b: Any, depth: int = 0) -> bool:
     """Semantic equality of parsed PDF objects (stream offsets ignored)."""
     if depth > P.MAX_NESTING:
@@ -675,10 +678,14 @@ def _analyze_post_seal(doc: P.PDFDocument, sealed_end: int, sigs: List[_Sig]) ->
         return True, (f"{len(tail)} trailing whitespace byte(s) outside the signed range, "
                       "no PDF content after sealing"), {"revisions_after": 0, "trailing_bytes": len(tail)}
 
+    doc.revisions()   # sets XrefSection.end, used below
     later = sorted((s for s in doc.sections if s.offset >= sealed_end), key=lambda s: s.offset)
     if not later:
         return False, (f"{len(tail)} byte(s) appended after sealing that are not a valid "
                        "incremental update"), {"appended_bytes": len(tail)}
+    if len(later) > MAX_REVISIONS_AFTER_SEAL:
+        return False, (f"{len(later)} revisions after sealing — more than this tool analyses "
+                       f"({MAX_REVISIONS_AFTER_SEAL})"), {"revisions_after": len(later)}
 
     try:
         sealed = P.PDFDocument(data[:sealed_end])
@@ -717,8 +724,8 @@ def _analyze_post_seal(doc: P.PDFDocument, sealed_end: int, sigs: List[_Sig]) ->
     # dictionaries; the superseded DSS objects of earlier post-seal revisions
     # stay in the file unreferenced. Accept them if they were DSS structure in
     # their own revision and are unchanged since (review round 3, B1).
-    for sec in later[:-1] if len(later) > 1 else []:
-        if sec.end <= 0 or len(later) > 32:
+    for sec in later[:-1]:
+        if sec.end <= 0:
             continue
         try:
             rdoc = P.PDFDocument(data[:sec.end])
