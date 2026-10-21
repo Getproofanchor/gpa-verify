@@ -258,6 +258,10 @@ def test_pinned_root_requires_time_stamping_ca(monkeypatch):
     assert check_trust_root(_der(good), [], AT).passed
     r = check_trust_root(_der(bad), [_der(id_ca)], AT)
     assert not r.passed and "not an SK time-stamping CA" in r.detail
+    direct = _cert("TSU", "Pinned Root", tk.public_key(), rk, ca=False, eku_ts=True)
+    assert not check_trust_root(_der(direct), [], AT).passed   # G1R/G1E-style root: never directly
+    monkeypatch.setattr(trust, "_ROOTS_ISSUING_TSA_DIRECTLY", {"Pinned Root"})
+    assert check_trust_root(_der(direct), [], AT).passed       # legacy-root style
     no_eku = _cert("TSU", "TSA CA", tk.public_key(), tsak, ca=False, eku_ts=False)
     assert not check_trust_root(_der(no_eku), [], AT).passed
 
@@ -322,3 +326,117 @@ def test_zip_bomb_member_rejected_before_reading():
         z.writestr("big.bin", b"\x00" * (40 << 20))
     _, r = verify_bytes(out.getvalue())
     assert any(c.name == "zip_structure" and not c.passed for c in r.checks)
+
+
+# ─── round 2: rewritten sealed streams / object streams ─────────────────────
+
+def _stream_typed(body: bytes, typ: bytes) -> bytes:
+    return b"<</Length " + str(len(body)).encode() + b"/Type/" + typ + b">>\nstream\n" + body + b"\nendstream"
+
+
+@pytest.mark.parametrize("typ", [b"ObjStm", b"XRef"])
+def test_sealed_content_stream_rewritten_with_container_type(sealed, typ):
+    """Reviewer round 2 F3/F4: obj 18 (page-2 content) and obj 5 (page-1
+    content) rewritten after sealing with a /Type that used to be waved
+    through."""
+    data, doc = sealed
+    for num in (5, 18):
+        upd = _update(data, {num: _stream_typed(b"BT /F1 28 Tf 60 600 Td (FORGED) Tj ET", typ)})
+        r = verify_sealed_pdf(upd)
+        assert not _post_seal(r).passed, (num, typ)
+        assert r.summary["verdict"] == "FAILED"
+
+
+def _update_xrefstm(data: bytes, plain: dict, compressed: dict, objstm_num: int) -> bytes:
+    """Incremental update with an xref STREAM; ``compressed`` objects are
+    placed into a new object stream ``objstm_num`` (type-2 entries)."""
+    doc = P.PDFDocument(data)
+    out = bytearray(data)
+    if not out.endswith(b"\n"):
+        out += b"\n"
+    hdr, body = b"", b""
+    for n, o in sorted(compressed.items()):
+        hdr += f"{n} {len(body)} ".encode()
+        body += o + b"\n"
+    os_data = hdr + body
+    offs = {}
+    plain = dict(plain)
+    plain[objstm_num] = (b"<</Type/ObjStm/N " + str(len(compressed)).encode() + b"/First "
+                         + str(len(hdr)).encode() + b"/Length " + str(len(os_data)).encode()
+                         + b">>\nstream\n" + os_data + b"\nendstream")
+    for n, b in sorted(plain.items()):
+        offs[n] = len(out)
+        out += f"{n} 0 obj\n".encode() + b + b"\nendobj\n"
+    xnum = max(list(plain) + list(compressed)) + 1
+    xo = len(out)
+    rows, index = b"", []
+    entries = {n: (1, offs[n], 0) for n in plain}
+    entries.update({n: (2, objstm_num, i) for i, n in enumerate(sorted(compressed))})
+    entries[xnum] = (1, xo, 0)
+    for n in sorted(entries):
+        t, f2, f3 = entries[n]
+        rows += bytes([t]) + f2.to_bytes(4, "big") + f3.to_bytes(2, "big")
+        index += [n, 1]
+    prev = int(data[data.rfind(b"startxref") + 9:].split()[0])
+    tr = {"Type": P.Name("XRef"), "Size": xnum + 1, "W": [1, 4, 2], "Index": index,
+          "Root": doc.trailer["Root"], "Info": doc.trailer["Info"], "Prev": prev, "Length": len(rows)}
+    out += f"{xnum} 0 obj\n".encode() + _ser(tr) + b"\nstream\n" + rows + b"\nendstream\nendobj\n"
+    out += b"startxref\n" + str(xo).encode() + b"\n%%EOF\n"
+    return bytes(out)
+
+
+def test_page_redefined_inside_new_object_stream(sealed):
+    """Reviewer round 2 G2 class: a sealed page object redefined after
+    sealing as a compressed object (type-2 xref entry) in a new ObjStm."""
+    data, doc = sealed
+    page = dict(doc.get_object(4))
+    page["Contents"] = P.Ref(48, 0)
+    upd = _update_xrefstm(data, {48: _stream(b"BT (FORGED) Tj ET")}, {4: _ser(page)}, 47)
+    d2 = P.PDFDocument(upd)
+    assert d2.get_object(4)["Contents"] == P.Ref(48, 0)        # what a viewer sees
+    r = verify_sealed_pdf(upd)
+    assert not _post_seal(r).passed
+    assert r.summary["verdict"] == "FAILED"
+
+
+def test_legit_dss_via_xref_stream_and_objstm_verifies(sealed):
+    data, doc = sealed
+    root = dict(doc.root)
+    root["DSS"] = P.Ref(49, 0)
+    upd = _update_xrefstm(data, {48: _stream(b"0\x82cert")},
+                          {49: b"<</Type/DSS/Certs[48 0 R]>>", 3: _ser(root)}, 47)
+    r = verify_sealed_pdf(upd)
+    assert _post_seal(r).passed, _post_seal(r).detail
+
+
+def test_orphan_object_after_seal_is_rejected(sealed):
+    data, doc = sealed
+    root = dict(doc.root)
+    root["DSS"] = P.Ref(48, 0)
+    upd = _update(data, {47: _stream(b"0\x82x"), 48: b"<</Type/DSS/Certs[47 0 R]>>", 3: _ser(root)})
+    i = upd.rfind(b"\nxref\n") + 1
+    upd = upd[:i] + b"4 0 obj\n<</Type/Page/Contents 47 0 R>>\nendobj\n" + upd[i:]
+    # the xref table moved; point startxref at it again
+    j = upd.rfind(b"startxref\n")
+    upd = upd[:j] + b"startxref\n" + str(upd.rfind(b"\nxref\n", 0, j) + 1).encode() + b"\n%%EOF\n"
+    r = verify_sealed_pdf(upd)
+    assert not _post_seal(r).passed
+
+
+def test_prev_skipping_sealed_revision_is_rejected(sealed):
+    data, doc = sealed
+    older = doc.sections[-1].offset           # oldest xref, before the sealing revision
+    out = bytearray(data)
+    xo = len(out)
+    out += b"xref\n0 1\n0000000000 65535 f \ntrailer\n" + _ser(
+        {"Size": int(doc.trailer["Size"]), "Root": doc.trailer["Root"], "Info": doc.trailer["Info"],
+         "Prev": older}) + b"\nstartxref\n" + str(xo).encode() + b"\n%%EOF\n"
+    r = verify_sealed_pdf(bytes(out))
+    assert not _post_seal(r).passed
+
+
+def test_visible_or_active_timestamp_widget_rejected():
+    from gpa_verify.forensic_browser import _widget_ok
+    assert _widget_ok({"FT": "Sig", "Rect": [0, 0, 0, 0], "Subtype": "Widget"})[0]
+    assert not _widget_ok({"FT": "Sig", "Rect": [0, 0, 100, 100]})[0]
+    assert not _widget_ok({"FT": "Sig", "Rect": [0, 0, 0, 0], "AA": {}})[0]

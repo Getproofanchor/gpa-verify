@@ -78,7 +78,8 @@ Every SaaS ZIP, Forensic Browser ZIP and sealed PDF now also runs
   G1R, ROOT G1E or EE Certification Centre Root CA (SHA-256 fingerprints in the
   README; compare with https://c.sk.ee/) — through CA certificates only, every
   signature and validity period checked at genTime;
-- be issued directly by the pinned *SK TSA CA 2023R* (or the root itself), so
+- be issued directly by the pinned *SK TSA CA 2023R* (older stamps: by EE
+  Certification Centre Root CA), so
   that a certificate issued under SK's ID-card, Smart-ID or e-seal CAs cannot
   pose as a TSA;
 - carry exactly the critical `id-kp-timeStamping` EKU.
@@ -96,9 +97,12 @@ list (Estonia: https://sr.riik.ee/tsl/estonian-tsl.xml) with `--tsl`.
 
 ## Hardening from the pre-release review
 
-- Sealed PDFs: after the time-stamp only a structurally valid Document
-  Security Store, document time-stamps with invisible widgets and the matching
-  catalog/AcroForm/page `/Annots` changes are accepted.
+- Sealed PDFs: the sealed revision is parsed on its own and every object of
+  the final document is compared with it. Only a structurally valid Document
+  Security Store, document time-stamps with invisible widgets and the
+  matching catalog/AcroForm/page `/Annots` changes are accepted; rewritten
+  sealed streams, shadow objects and xref chains that skip the sealed
+  revision fail.
 - Hostile PDFs and ZIPs are refused within bounded time and memory (limits in
   the README).
 - Duplicate ZIP member names fail (`zip_structure`).

@@ -94,8 +94,9 @@ def qualified_status(checks) -> Optional[str]:
     """'per_supplied_tsl' | 'not_checked' | 'failed' | None (no time-stamp).
     Review S1: never call a time-stamp qualified unless a Trusted List said so."""
     tq = [c for c in checks if c.name.endswith("tsl_qualified")]
-    if not tq:
-        return None
+    tok = [c for c in checks if c.name.endswith("timestamp_token") or c.name == "eidas_signature"]
+    if not tq or not any(not c.skipped for c in tok):
+        return None   # no time-stamp token at all (review round 2, N1)
     if any(not c.passed and not c.skipped for c in tq):
         return "failed"
     if all(c.passed and not c.skipped for c in tq):
@@ -638,12 +639,33 @@ def _der_len(b: bytes) -> int:
     return 2 + k + int.from_bytes(b[2:2 + k], "big")
 
 
+def _same(a: Any, b: Any, depth: int = 0) -> bool:
+    """Semantic equality of parsed PDF objects (stream offsets ignored)."""
+    if depth > P.MAX_NESTING:
+        return False
+    if isinstance(a, P.Stream) or isinstance(b, P.Stream):
+        return (isinstance(a, P.Stream) and isinstance(b, P.Stream) and a.raw == b.raw
+                and _same(a.dict, b.dict, depth + 1))
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, dict):
+        return a.keys() == b.keys() and all(_same(a[k], b[k], depth + 1) for k in a)
+    if isinstance(a, list):
+        return len(a) == len(b) and all(_same(x, y, depth + 1) for x, y in zip(a, b))
+    return a == b
+
+
 def _analyze_post_seal(doc: P.PDFDocument, sealed_end: int, sigs: List[_Sig]) -> Tuple[bool, str, Dict[str, Any]]:
     """Classify everything after the sealed byte range.
 
     Allowed after a document time-stamp (PAdES-LTV, ETSI EN 319 142-1 §5.4):
     a Document Security Store (/DSS, /VRI, certificate / CRL / OCSP streams)
     and further document time-stamps. Anything else is a modification.
+
+    Method (review round 2): the sealed revision is parsed on its own from
+    the sealed bytes; then EVERY object of the final document (as a viewer
+    resolves it through the final xref, object streams included) is compared
+    with the sealed one. Each difference must match a permitted LTV pattern.
     """
     data = doc.data
     tail = data[sealed_end:]
@@ -657,71 +679,114 @@ def _analyze_post_seal(doc: P.PDFDocument, sealed_end: int, sigs: List[_Sig]) ->
     if not later:
         return False, (f"{len(tail)} byte(s) appended after sealing that are not a valid "
                        "incremental update"), {"appended_bytes": len(tail)}
-    earlier = [s for s in doc.sections if 0 <= s.offset < sealed_end]
-    if not earlier:
-        return False, "xref chain does not reach the sealed revision (document rewritten)", {}
 
-    # object table as of the sealed revision
-    sealed_entries: Dict[int, Tuple[str, int, int]] = {}
-    for s in sorted(earlier, key=lambda s: -s.offset):
-        for k, v in s.entries.items():
-            sealed_entries.setdefault(k, v)
+    try:
+        sealed = P.PDFDocument(data[:sealed_end])
+    except P.PDFError as exc:
+        return False, f"sealed revision cannot be parsed on its own: {exc}", {}
+    if any("rebuilt" in w for w in sealed.warnings) or not sealed.sections or sealed.sections[0].offset < 0:
+        return False, "sealed revision's cross-reference table cannot be read", {}
+    sealed_xref = sealed.sections[0].offset
+    if sealed_xref not in {s.offset for s in doc.sections}:
+        return False, ("MODIFIED AFTER SEALING: the cross-reference chain of the final document "
+                       "does not pass through the sealed revision"), {}
+    if doc.trailer.get("Root") != sealed.trailer.get("Root"):
+        return False, "MODIFIED AFTER SEALING: document catalog (/Root) replaced", {}
 
-    changes: List[Dict[str, Any]] = []
     disallowed: List[Dict[str, Any]] = []
+    changes: List[Dict[str, Any]] = []
 
-    # Objects that make up the current Document Security Store. Only the DSS
-    # structure itself is followed (ETSI EN 319 142-1 §5.4.2) — never
-    # arbitrary references (review R1: a DSS pointing at a page made a forged
-    # page "permitted").
-    dss_struct, dss_streams, dss_problems = _collect_dss(doc, doc.root.get("DSS"))
-
-    later_sig_nums = {s.num for s in sigs if s.end > sealed_end and s.num is not None}
-    root_num = doc.trailer.get("Root").num if isinstance(doc.trailer.get("Root"), P.Ref) else None
-    info_num = doc.trailer.get("Info").num if isinstance(doc.trailer.get("Info"), P.Ref) else None
-
+    # objects written after sealing but not listed in any later xref (shadow objects)
+    listed = {s.offset for s in later}
     for sec in later:
-        for num, ent in sorted(sec.entries.items()):
-            if num == 0:
-                continue
-            kind = ent[0]
-            prev = sealed_entries.get(num)
-            if kind == "f":
-                if prev and prev[0] != "f":
-                    disallowed.append({"object": num, "change": "deleted"})
-                continue
-            if kind == "n":
-                try:
-                    _, _, obj = P.Parser(data, resolver=doc).parse_indirect_at(ent[1])
-                except P.PDFError:
-                    disallowed.append({"object": num, "change": "unparsable"})
-                    continue
-            else:
-                try:
-                    obj = doc.get_object(num, entries=sec.entries)
-                except P.PDFError:
-                    obj = None
-            is_new = prev is None or prev[0] == "f"
-            reason = _classify_change(doc, num, obj, prev, is_new, dss_struct, dss_streams,
-                                      later_sig_nums, root_num, info_num, sealed_entries)
-            rec = {"object": num, "new": is_new, "revision_xref": sec.offset, "classified": reason[1]}
-            changes.append(rec)
-            if not reason[0]:
-                disallowed.append(rec)
+        listed.update(e[1] for e in sec.entries.values() if e[0] == "n")
+    for m in _OBJ_HEAD_RE.finditer(data, sealed_end):
+        if m.start() not in listed:
+            disallowed.append({"object": int(m.group(1)), "offset": m.start(),
+                               "classified": "object body not listed in any cross-reference section"})
+            if len(disallowed) > 50:
+                break
+
+    dss_struct, dss_streams, dss_problems = _collect_dss(doc, doc.root.get("DSS"))
+    later_sig_nums = {s.num for s in sigs if s.end > sealed_end and s.num is not None}
+    xref_stream_offsets = {s.offset for s in later if s.kind == "stream"}
+    root_num = doc.trailer["Root"].num if isinstance(doc.trailer.get("Root"), P.Ref) else None
+    info_num = doc.trailer.get("Info").num if isinstance(doc.trailer.get("Info"), P.Ref) else None
+    if doc.trailer.get("Info") != sealed.trailer.get("Info"):
+        info_num = None   # a replaced Info object is classified like any other new object
+
+    ctx = _Ctx(doc, sealed, dss_struct, dss_streams, later_sig_nums, root_num, info_num,
+               xref_stream_offsets)
+    # appearance streams of new, invisible time-stamp widgets
+    for num in sorted(set(doc.xref) - set(sealed.xref)):
+        o = _safe_get(doc, num)
+        if _is_ts_widget_obj(o, later_sig_nums) and _widget_ok(o)[0]:
+            ap = o.get("AP")
+            ap = doc.resolve(ap) if isinstance(ap, P.Ref) else ap
+            if isinstance(ap, dict):
+                for v in ap.values():
+                    if isinstance(v, P.Ref):
+                        ctx.widget_ap.add(v.num)
+
+    nums = sorted(set(doc.xref) | set(sealed.xref))
+    if len(nums) > 1_000_000:
+        return False, "too many objects", {}
+    for num in nums:
+        if num == 0:
+            continue
+        cur_e, old_e = doc.xref.get(num), sealed.xref.get(num)
+        cur = _safe_get(doc, num) if cur_e and cur_e[0] != "f" else None
+        old = _safe_get(sealed, num) if old_e and old_e[0] != "f" else None
+        if cur is _BROKEN or old is _BROKEN:
+            disallowed.append({"object": num, "classified": "unparsable object"})
+            continue
+        if old is None and cur is None:
+            continue
+        if cur is None:
+            disallowed.append({"object": num, "classified": "deleted after sealing"})
+            continue
+        if old is not None and _same(old, cur):
+            continue
+        ok, why = _classify_change(ctx, num, cur, old)
+        rec = {"object": num, "new": old is None, "classified": why}
+        changes.append(rec)
+        if not ok:
+            disallowed.append(rec)
 
     extra = {"revisions_after": len(later), "changed_objects": changes[:50]}
-    if dss_problems and changes:
+    if dss_problems and dss_struct:
         disallowed.append({"object": None, "classified": "invalid DSS: " + "; ".join(dss_problems[:3])})
     if disallowed:
         return False, (f"MODIFIED AFTER SEALING: {len(disallowed)} object change(s) in "
                        f"{len(later)} later revision(s) are not LTV/time-stamp updates "
                        f"(e.g. {disallowed[0]})"), {**extra, "disallowed": disallowed[:50]}
     kinds = sorted({c["classified"] for c in changes})
-    tail_after = data[max(s.end for s in later):] if later else b""
-    if later and tail_after.strip(b" \t\r\n\x00"):
+    tail_after = data[max(s.end for s in later):]
+    if tail_after.strip(b" \t\r\n\x00"):
         return False, f"{len(tail_after)} byte(s) of unrecognised data after the last revision", extra
     return True, (f"{len(later)} later revision(s) contain only permitted LTV / document "
-                  f"time-stamp updates ({', '.join(kinds)})"), extra
+                  f"time-stamp updates ({', '.join(kinds) or 'no object changes'})"), extra
+
+
+_BROKEN = object()
+
+
+def _safe_get(d: P.PDFDocument, num: int) -> Any:
+    try:
+        return d.get_object(num)
+    except P.PDFError:
+        return _BROKEN
+
+
+class _Ctx:
+    def __init__(self, doc, sealed, dss_struct, dss_streams, later_sig_nums, root_num,
+                 info_num, xref_stream_offsets):
+        self.doc, self.sealed = doc, sealed
+        self.dss_struct, self.dss_streams = dss_struct, dss_streams
+        self.later_sig_nums = later_sig_nums
+        self.root_num, self.info_num = root_num, info_num
+        self.xref_stream_offsets = xref_stream_offsets
+        self.widget_ap: set = set()
 
 
 _DSS_KEYS = {"Type", "Certs", "CRLs", "OCSPs", "VRI"}
@@ -796,101 +861,118 @@ def _collect_dss(doc, dss_ref) -> Tuple[set, set, List[str]]:
     return struct, streams, probs
 
 
-def _old_object(doc, num, prev, sealed_entries):
-    if prev is None or prev[0] == "f":
-        return None
-    try:
-        if prev[0] == "n":
-            _, _, old = P.Parser(doc.data, resolver=doc).parse_indirect_at(prev[1])
-            return old
-        return doc.get_object(num, entries=sealed_entries)
-    except P.PDFError:
-        return None
-
-
 def _zero_rect(r) -> bool:
     return (isinstance(r, list) and len(r) == 4 and all(isinstance(v, (int, float)) for v in r)
             and (r[2] - r[0]) == 0 and (r[3] - r[1]) == 0)
 
 
-def _classify_change(doc, num, obj, prev, is_new, dss_struct, dss_streams, later_sig_nums,
-                     root_num, info_num, sealed_entries) -> Tuple[bool, str]:
-    """Rules (review R1): a sealed object may change only in the few ways an
-    LTV / document time-stamp writer needs; new objects are allowed only as
-    DSS structure/data, xref/object streams, or a new document time-stamp
-    (signature dict + invisible widget)."""
-    if isinstance(obj, P.Stream):
+_WIDGET_KEYS = {"Type", "Subtype", "FT", "V", "T", "TU", "F", "Ff", "Rect", "P", "AP", "MK",
+                "DA", "Border", "StructParent"}
+
+
+def _widget_ok(o: Dict[str, Any]) -> Tuple[bool, str]:
+    extra_keys = set(o) - _WIDGET_KEYS
+    if extra_keys:
+        return False, "time-stamp widget with unexpected keys " + ",".join(sorted(extra_keys))
+    if o.get("Subtype") not in (None, "Widget"):
+        return False, "time-stamp field is not a widget"
+    if "Rect" in o and not _zero_rect(o.get("Rect")):
+        return False, "visible time-stamp widget"
+    return True, "time-stamp field (invisible)"
+
+
+def _classify_change(ctx: "_Ctx", num: int, obj: Any, old: Any) -> Tuple[bool, str]:
+    """Rules: a sealed object may change only in the few ways an LTV /
+    document time-stamp writer needs; a new object is allowed only as DSS
+    structure/data, the revision's own xref stream, an object stream, or a new
+    document time-stamp (signature dict + invisible widget + its appearance)."""
+    doc, sealed = ctx.doc, ctx.sealed
+    is_new = old is None
+    if isinstance(obj, P.Stream) or isinstance(old, P.Stream):
+        if not is_new:
+            return False, "sealed stream rewritten"   # whatever its /Type (review round 2)
         t = obj.get("Type")
+        ent = doc.xref.get(num)
         if t == "XRef":
-            return True, "xref stream"
+            if ent and ent[0] == "n" and ent[1] in ctx.xref_stream_offsets:
+                return True, "xref stream"
+            return False, "stream typed /XRef that is not a cross-reference section"
         if t == "ObjStm":
-            return True, "object stream"
-        if num in dss_streams and is_new:
+            return True, "object stream (its objects are checked one by one)"
+        if num in ctx.dss_streams:
             return True, "DSS data (certificate/CRL/OCSP)"
-        if num in dss_streams:
-            return False, "sealed stream rewritten and referenced from DSS"
-        if t == "Metadata":
-            return False, "XMP metadata changed"
-        return False, "new or changed content stream"
-    old = _old_object(doc, num, prev, sealed_entries)
+        if num in ctx.widget_ap and t == "XObject" and obj.get("Subtype") == "Form" \
+                and len(obj.raw) <= 65536:
+            return True, "time-stamp widget appearance"
+        return False, "new content stream"
     t = obj.get("Type") if isinstance(obj, dict) else None
 
-    if num in dss_struct:
+    if num in ctx.dss_struct:
         if is_new:
             return True, "DSS / VRI"
-        # a sealed object may only be "rewritten" as DSS if it was the DSS before
-        sealed_root = None
-        if root_num is not None:
-            sealed_root = _old_object(doc, root_num, sealed_entries.get(root_num), sealed_entries)
+        sroot = sealed.root
         was_dss = (isinstance(old, dict) and old.get("Type") == "DSS") or (
-            isinstance(sealed_root, dict) and isinstance(sealed_root.get("DSS"), P.Ref)
-            and sealed_root["DSS"].num == num)
+            isinstance(sroot.get("DSS"), P.Ref) and sroot["DSS"].num == num)
         return (True, "DSS updated") if was_dss else (False, "sealed object reused as DSS structure")
 
     if not isinstance(obj, dict):
-        return False, "non-dictionary object changed"
+        return False, "non-dictionary object changed" if not is_new else "new non-dictionary object"
 
-    if t == "DocTimeStamp" or num in later_sig_nums:
+    if t == "DocTimeStamp" or num in ctx.later_sig_nums:
         if not is_new:
             return False, "sealed object turned into a signature dictionary"
-        return (True, "document time-stamp") if obj.get("SubFilter") == "ETSI.RFC3161" \
-            else (False, "new signature (not a document time-stamp)")
-    if is_new and _is_ts_widget_obj(obj, later_sig_nums):
-        if "Rect" in obj and not _zero_rect(obj.get("Rect")):
-            return False, "visible time-stamp widget"
-        return True, "time-stamp field (invisible)"
+        keys_ok = set(obj) <= {"Type", "Filter", "SubFilter", "Contents", "ByteRange", "M",
+                               "Name", "Reason", "Location", "ContactInfo", "Prop_Build"}
+        if obj.get("SubFilter") == "ETSI.RFC3161" and keys_ok:
+            return True, "document time-stamp"
+        return False, "new signature (not a plain document time-stamp)"
+    if is_new and _is_ts_widget_obj(obj, ctx.later_sig_nums):
+        return _widget_ok(obj)
 
     if not isinstance(old, dict):
         return False, "new object of unknown purpose" if is_new else "changed object"
-    diff = {k for k in set(old) | set(obj) if old.get(k) != obj.get(k)}
+    diff = {k for k in set(old) | set(obj) if not _same(old.get(k), obj.get(k))}
     if not diff:
         return True, "rewritten (identical)"
-    if num == root_num or t == "Catalog":
+    if num == ctx.root_num:
         bad = diff - {"DSS", "AcroForm", "Extensions"}
         if bad:
             return False, "catalog changed: " + ",".join(sorted(bad))
-        if "AcroForm" in diff and not (isinstance(old.get("AcroForm"), P.Ref)
-                                       and old.get("AcroForm") == obj.get("AcroForm")):
-            ok, why = _acroform_ok(doc, doc.resolve(old.get("AcroForm")),
-                                   doc.resolve(obj.get("AcroForm")), later_sig_nums)
+        if "AcroForm" in diff:
+            o_af, n_af = old.get("AcroForm"), obj.get("AcroForm")
+            if isinstance(o_af, P.Ref) or isinstance(n_af, P.Ref):
+                return False, "catalog AcroForm reference replaced"
+            ok, why = _acroform_ok(ctx, o_af, n_af)
             if not ok:
                 return False, "catalog AcroForm: " + why
+        if "Extensions" in diff and not _extensions_ok(obj.get("Extensions")):
+            return False, "catalog /Extensions is not a developer-extensions dictionary"
         return True, "catalog: " + ",".join(sorted(diff))
-    if num == info_num:
+    if num == ctx.info_num:
         bad = diff - {"Producer", "ModDate"}
         return (not bad, "document info (Producer/ModDate)" if not bad else "document info changed: " + ",".join(sorted(bad)))
     if t == "Page" or "Annots" in diff:
         if diff == {"Annots"}:
-            old_a = _ref_nums(doc, old.get("Annots"))
+            old_a = _ref_nums(sealed, old.get("Annots"))
             new_a = _ref_nums(doc, obj.get("Annots"))
-            if old_a is not None and new_a is not None and old_a <= new_a and \
-                    all(_is_ts_widget(doc, n, later_sig_nums) for n in new_a - old_a):
+            if not isinstance(old.get("Annots"), P.Ref) and not isinstance(obj.get("Annots"), P.Ref) \
+                    and old_a is not None and new_a is not None and old_a <= new_a and \
+                    all(_is_ts_widget(doc, n, ctx.later_sig_nums) for n in new_a - old_a):
                 return True, "page: time-stamp widget added"
         return False, "page changed: " + ",".join(sorted(diff))
     if t == "AcroForm" or "Fields" in diff:
-        ok, why = _acroform_ok(doc, old, obj, later_sig_nums)
+        ok, why = _acroform_ok(ctx, old, obj)
         return (True, "AcroForm fields (time-stamp)") if ok else (False, "AcroForm changed: " + why)
     return False, "changed object: " + ",".join(sorted(diff))
+
+
+def _extensions_ok(x: Any) -> bool:
+    if not isinstance(x, dict):
+        return False
+    for v in x.values():
+        if not isinstance(v, dict) or set(v) - {"Type", "BaseVersion", "ExtensionLevel", "URL"}:
+            return False
+    return True
 
 
 def _ref_nums(doc, x) -> Optional[set]:
@@ -902,18 +984,21 @@ def _ref_nums(doc, x) -> Optional[set]:
     return {r.num for r in x if isinstance(r, P.Ref)}
 
 
-def _acroform_ok(doc, old, new, later_sig_nums) -> Tuple[bool, str]:
+def _acroform_ok(ctx: "_Ctx", old, new) -> Tuple[bool, str]:
     if not isinstance(new, dict):
         return False, "not a dictionary"
     if not isinstance(old, dict):
         old = {}
-    diff = {k for k in set(old) | set(new) if old.get(k) != new.get(k)}
+    diff = {k for k in set(old) | set(new) if not _same(old.get(k), new.get(k))}
     if diff - {"Fields", "SigFlags"}:
         return False, ",".join(sorted(diff - {"Fields", "SigFlags"}))
-    of, nf = _ref_nums(doc, old.get("Fields")), _ref_nums(doc, new.get("Fields"))
+    if isinstance(old.get("Fields"), P.Ref) or isinstance(new.get("Fields"), P.Ref):
+        if "Fields" in diff:
+            return False, "indirect /Fields array replaced"
+    of, nf = _ref_nums(ctx.sealed, old.get("Fields")), _ref_nums(ctx.doc, new.get("Fields"))
     if of is None or nf is None or not of <= nf:
         return False, "existing fields removed or replaced"
-    if not all(_is_ts_widget(doc, n, later_sig_nums) for n in nf - of):
+    if not all(_is_ts_widget(ctx.doc, n, ctx.later_sig_nums) for n in nf - of):
         return False, "added field is not a document time-stamp"
     return True, "fields appended"
 

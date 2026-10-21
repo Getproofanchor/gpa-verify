@@ -131,7 +131,7 @@ gpa-verify GetProofAnchor_sess-1792572400480_bez-pecete.pdf \
 | Input | What a `VERIFIED` verdict proves |
 |-------|----------------------------------|
 | **ZIP package** (`getproofanchor-lite-2`) | Every file matches `manifest.json`; every *sealed* file (screenshots, HTML, HAR, DNS, capture metadata, `proof.json`, optional MHTML/video — one `pages/NN/` directory per captured page) matches the hash listed in `timestamp/eidas_payload.json`, whose SHA-256 is the message imprint of the RFC 3161 token `timestamp/eidas.tsr`. The token signature, signed attributes, TSA certificate chain and the TSA's *granted* status at genTime in the bundled EU Trusted List are checked. Unsealed files (report, token, certificates, TSL snapshot) are reported as such. |
-| **Sealed PDF** (PAdES document time-stamp, `/ETSI.RFC3161`) | The `/ByteRange` covers the whole file except the `/Contents` value; the embedded time-stamp's imprint equals the hash of those bytes, so the report **and every embedded artefact** (`/EmbeddedFiles`) existed in this exact form at genTime. Each attachment is listed with its SHA-256 and compared to the embedded `manifest.json` and `proof.json`. Any revision appended after the time-stamp is classified: Document Security Store / VRI / further document time-stamps are permitted (LTV); anything else is reported as **modified after sealing**, with the byte length and SHA-256 of the sealed version. |
+| **Sealed PDF** (PAdES document time-stamp, `/ETSI.RFC3161`) | The `/ByteRange` covers the whole file except the `/Contents` value; the embedded time-stamp's imprint equals the hash of those bytes, so the report **and every embedded artefact** (`/EmbeddedFiles`) existed in this exact form at genTime. Each attachment is listed with its SHA-256 and compared to the embedded `manifest.json` and `proof.json`. If revisions were appended after the time-stamp, the sealed revision is parsed on its own and **every object** of the final document (object streams included) is compared with it; only a Document Security Store (certificate/CRL/OCSP streams, VRI) and further invisible document time-stamps are permitted (LTV). Anything else — including objects not listed in any cross-reference section, or an xref chain that skips the sealed revision — is reported as **modified after sealing**, with the byte length and SHA-256 of the sealed version. |
 | **Plain copy** (`*_bez-pecete.pdf`, unsealed) | Alone: nothing — it is reported as `NOT VERIFIABLE BY ITSELF` (exit 3) together with the identification it carries (sealed file name, SHA-256, session id, time-stamp serial and time, read from its QR code and printed text). With `--original`: the original is fully verified, and the copy's identification data must match it exactly. It is **not** proven that the copy's pages are a faithful rendering of the original. |
 
 Sealed PDFs embed no Trusted List, so the TSA's qualified status is
@@ -155,9 +155,9 @@ input therefore also runs `tsa_trust_root`. The TSA signer certificate must:
   every link's signature verified, every issuer a CA certificate
   (basicConstraints cA, keyUsage keyCertSign, pathLenConstraint) and every
   certificate valid at genTime;
-* be issued **directly by an SK time-stamping CA** (*SK TSA CA 2023R*) or by
-  the root itself (SK's older TSA certificates were issued by EE
-  Certification Centre Root CA). The same roots also anchor SK's ID-card,
+* be issued **directly by an SK time-stamping CA** (*SK TSA CA 2023R*) or,
+  for SK's older TSA certificates, directly by EE Certification Centre Root
+  CA. The same roots also anchor SK's ID-card,
   Smart-ID and e-seal CAs; a certificate issued under those cannot pass as a
   TSA;
 * carry exactly the critical `id-kp-timeStamping` extended key usage and not
@@ -194,8 +194,10 @@ no extra dependencies.
 
 ## What it actually checks
 
-Verification runs in seven layers, each tightening the forensic claim.
-**All layers must pass for a `VERIFIED` verdict.**
+A SaaS ZIP runs 12 checks (the layers below plus `tsl_qualified`,
+`file_digest`, the informational anchor witness, `anchor_inclusion` and
+`tsa_trust_root`), each tightening the forensic claim.
+**Every check that applies must pass for a `VERIFIED` verdict.**
 
 ### Layer 1 — Bundle integrity
 

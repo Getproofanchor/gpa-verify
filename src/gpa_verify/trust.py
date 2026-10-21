@@ -259,9 +259,8 @@ def _anchors() -> Dict[str, Tuple[str, bytes, bool]]:
 
 def _tsa_issuer_spkis() -> Dict[str, str]:
     """SPKI hashes of the CAs allowed to issue a TSA certificate directly under
-    the pinned SK roots: the SK TSA issuing CA(s), and the roots themselves
-    (SK's older TSA certificates were issued directly by EE Certification
-    Centre Root CA). SK's personal-ID, Smart-ID and e-seal CAs are NOT here —
+    the pinned SK roots: the SK TSA issuing CA(s), and EE Certification Centre
+    Root CA, which issued SK's older TSA certificates directly. SK's personal-ID, Smart-ID and e-seal CAs are NOT here —
     a key certified by them cannot pass as a TSA (review R2)."""
     from cryptography import x509 as cx509
 
@@ -269,8 +268,14 @@ def _tsa_issuer_spkis() -> Dict[str, str]:
     for (name, _fp, _pem), der in zip(_KNOWN_INTERMEDIATES, KNOWN_INTERMEDIATES):
         out[_spki_sha(cx509.load_der_x509_certificate(der))] = name
     for name, der in PINNED_ROOTS:
-        out[_spki_sha(cx509.load_der_x509_certificate(der))] = name
+        if name in _ROOTS_ISSUING_TSA_DIRECTLY:
+            out[_spki_sha(cx509.load_der_x509_certificate(der))] = name
     return out
+
+
+# Only the legacy root issued SK's TSA certificates directly; G1R/G1E issue
+# through SK TSA CA 2023R (review round 2, S4).
+_ROOTS_ISSUING_TSA_DIRECTLY = {"EE Certification Centre Root CA"}
 
 
 def _leaf_problem(der: bytes) -> Optional[str]:
@@ -361,7 +366,7 @@ def check_trust_root(
                 name=name, passed=False,
                 detail=(f"TSA certificate chains to {hit[1]} but is issued by "
                         f"{ch['subjects'][1]}, which is not an SK time-stamping CA "
-                        "(only SK TSA CA 2023R or the root itself may issue TSA certificates)"),
+                        "(only SK TSA CA 2023R, or for older stamps EE Certification Centre Root CA, may issue TSA certificates)"),
                 extra=extra)
         extra["tsa_issuer"] = allowed[issuer_spki]
     extra["trust_root"] = hit[1]

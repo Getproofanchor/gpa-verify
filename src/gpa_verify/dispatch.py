@@ -50,6 +50,8 @@ def detect_kind(data: bytes) -> str:
             return "sealed_pdf" if b"/ByteRange" in data else "pdf_damaged"
         k = {"sealed": "sealed_pdf", "plain_copy": "plain_copy",
              "fb_report": "fb_report"}.get(c, "pdf_unsigned")
+        if k == "pdf_unsigned" and any("rebuilt" in w for w in doc.warnings):
+            return "pdf_damaged"
         if k == "pdf_unsigned" and (b"/ByteRange" in data or b"ETSI.RFC3161" in data):
             return "sealed_pdf"   # garbled signature: let the PAdES verifier explain (N5)
         return k

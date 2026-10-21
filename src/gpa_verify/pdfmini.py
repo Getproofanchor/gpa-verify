@@ -218,6 +218,7 @@ class Parser:
         self.lex = Lexer(data, pos, end)
         self.resolver = resolver
         self._pending: List[Any] = []
+        self._depth = 0
 
     @property
     def pos(self) -> int:
@@ -250,6 +251,23 @@ class Parser:
                 return tok
             self._push(t2)
             return tok
+        if tok in (b"<<", b"["):
+            self._depth += 1
+            if self._depth > MAX_NESTING:
+                raise PDFError(f"objects nested deeper than {MAX_NESTING} levels")
+            try:
+                return self._container(tok)
+            finally:
+                self._depth -= 1
+        if tok == b"true":
+            return True
+        if tok == b"false":
+            return False
+        if tok == b"null":
+            return None
+        return tok  # Name, PDFString, float, keyword bytes
+
+    def _container(self, tok: Any) -> Any:
         if tok == b"<<":
             out: Dict[str, Any] = {}
             while True:
@@ -274,13 +292,7 @@ class Parser:
                     raise PDFError("unterminated array")
                 arr.append(self._from_token(t))
             return arr
-        if tok == b"true":
-            return True
-        if tok == b"false":
-            return False
-        if tok == b"null":
-            return None
-        return tok  # Name, PDFString, float, keyword bytes
+        raise PDFError("not a container")  # pragma: no cover
 
     def parse_indirect_at(self, offset: int) -> Tuple[int, int, Any]:
         """Parse ``N G obj ... endobj`` at file offset; returns (num, gen, obj)."""
@@ -342,6 +354,9 @@ class Parser:
 MAX_STREAM_DECODED = 64 << 20      # bytes per decoded stream
 MAX_DOC_DECODED = 256 << 20        # bytes decoded per document (all streams)
 MAX_PREDICTOR_INPUT = 16 << 20     # PNG/TIFF predictors run in pure Python
+
+
+MAX_NESTING = 256                  # dict/array nesting depth
 
 
 class LimitExceeded(PDFError):

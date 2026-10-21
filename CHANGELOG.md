@@ -11,7 +11,8 @@
   Certification Centre Root CA (pinned in `gpa_verify.trust`) through CA
   certificates only (basicConstraints, keyUsage keyCertSign,
   pathLenConstraint — enforced in `build_chain` for every chain), be issued
-  directly by the pinned *SK TSA CA 2023R* (or by the root itself), and carry
+  directly by the pinned *SK TSA CA 2023R* (older stamps: directly by EE
+  Certification Centre Root CA), and carry
   exactly the critical `id-kp-timeStamping` EKU. A certificate issued under
   SK's ID-card or e-seal CAs therefore cannot pass as a TSA. Other TSAs:
   `--trust-root root.pem`.
@@ -19,11 +20,16 @@
   Forensic Browser verifier**: no fallback to the first certificate when the
   SignerInfo matches none, exactly one messageDigest, content-type and ESS
   signing-certificate binding, exact critical timeStamping EKU.
-- **PAdES post-seal analysis only accepts a genuine Document Security Store**
-  (pre-release review). The DSS is followed only through its defined
-  structure (Certs/CRLs/OCSPs/VRI → streams); a sealed object can no longer be
-  "permitted" by listing it in a DSS, catalog AcroForm swaps and visible
-  time-stamp widgets are rejected.
+- **PAdES post-seal analysis compares every object with the sealed revision**
+  (pre-release review, two rounds). The sealed revision is parsed on its own
+  from the sealed bytes, and every object of the final document — as a
+  viewer resolves it, object streams included — must equal it or match a
+  permitted LTV pattern: a DSS followed only through its defined structure
+  (Certs/CRLs/OCSPs/VRI → new streams), new document time-stamps with
+  invisible, action-free widgets, and the matching catalog/AcroForm/page
+  `/Annots` changes. Rewritten sealed streams (whatever their `/Type`),
+  objects not listed in any xref section, an xref chain skipping the sealed
+  revision and a replaced `/Root` are reported as modifications.
 - **Resource limits for hostile input**: linear signature scan (≤ 64
   signature dictionaries), bounded FlateDecode (64 MB per stream, 256 MB per
   document), validated predictor parameters and xref-stream /W, ZIP member
