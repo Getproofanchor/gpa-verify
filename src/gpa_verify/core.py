@@ -759,6 +759,21 @@ def check_eidas_signature(
                 detail=f"unsupported sig algo: {sig_algo}",
             )
 
+        # The signature covers signed_attrs only; bind them to the TSTInfo
+        # actually present (RFC 5652 §5.4 messageDigest). Without this an
+        # altered TSTInfo (imprint, genTime) would pass with a valid signature.
+        md_attr = next(
+            (a["values"][0].native for a in signed_attrs
+             if a["type"].native == "message_digest"),
+            None,
+        )
+        if md_attr is None or md_attr != hashlib.new(digest_algo, econtent).digest():
+            return CheckResult(
+                name="eidas_signature",
+                passed=False,
+                detail="signed messageDigest does not match TSTInfo — token content altered after signing",
+            )
+
         # All passed
         gen_time = tst_info["gen_time"].native
         return CheckResult(
@@ -1676,6 +1691,11 @@ def verify_evidence_zip(
             detail="manifest.json missing or invalid JSON",
         ))
         return report
+
+    # Forensic Browser (desktop app) packages have their own layout.
+    from .forensic_browser import is_fb_manifest, verify_fb_zip
+    if is_fb_manifest(manifest, _read_zip_json(zf, "proof.json")):
+        return verify_fb_zip(zip_bytes)
 
     report.proof_id = manifest.get("proof_id")
     report.bundle_format = manifest.get("format")

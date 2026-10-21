@@ -1,5 +1,47 @@
 # Changelog
 
+## [Unreleased] — Forensic Browser support
+
+### Security
+
+- **The eIDAS token's signed attributes are now bound to its content.** The
+  `eidas_signature` layer verified the CMS signature over the signed
+  attributes but never compared the signed `messageDigest` with the digest
+  of the encapsulated TSTInfo. A TSTInfo re-encoded with a different
+  message imprint (or genTime) therefore still passed, which allowed a
+  forged `eidas_payload.json` to be reported as time-stamped. The check is
+  now enforced. Re-verify bundles checked with 1.5.0 or earlier.
+
+### Added
+
+- Verification of GetProofAnchor **Forensic Browser** (desktop app) outputs,
+  auto-detected by `gpa-verify <file>`:
+  - **ZIP packages** (`getproofanchor-lite-2`): manifest integrity, binding of
+    every sealed file through `timestamp/eidas_payload.json`, multi-page
+    sessions (`pages/NN/`), RFC 3161 token, TSA chain, EU Trusted List status
+    at genTime, consistency of the producer's time-stamp metadata and report.
+    Previously these packages failed with `unsupported format`.
+  - **PAdES-sealed PDFs** (document time-stamp, ETSI EN 319 142): ByteRange
+    coverage, token over the signed bytes, attachments with SHA-256 vs the
+    embedded manifest, and classification of incremental updates after
+    sealing (LTV/DSS permitted, anything else reported as modified).
+  - **Unsealed plain copies** (`*_bez-pecete.pdf`): identification read from
+    the QR code and the printed text; reported as not verifiable by itself,
+    or matched against the sealed original with `--original`.
+- New CLI options `--original`, `--tsl`, `--certs`; new exit code `3`
+  (not verifiable by itself).
+- Strict RFC 3161 token verifier (`tsp_verify`): content-type and
+  messageDigest attributes, ESS signing-certificate(-v2),
+  CMSAlgorithmProtection, critical timeStamping EKU, genTime within the
+  certificate validity, chain building with per-link signature checks,
+  Trusted List status evaluated with service history.
+- Small pure-Python PDF reader (`pdfmini`) and QR-code reader (`qrdecode`) —
+  no new dependencies.
+- API: `verify_bytes`, `detect_kind`, `verify_fb_zip`, `verify_sealed_pdf`,
+  `verify_plain_copy`. `verify_evidence_zip` routes Forensic Browser ZIPs to
+  the new verifier.
+- docs/forensic-browser-formats.md — the formats as found in real outputs.
+
 ## [1.5.0] — 2026-08-03
 
 ### Security

@@ -5,11 +5,17 @@ Usage:
     gpa-verify path/to/evidence.zip
     gpa-verify --json path/to/evidence.zip > report.json
     gpa-verify --quiet path/to/evidence.zip ; echo $?
+    gpa-verify sealed.pdf [--tsl EE.xml|dir|package.zip]
+    gpa-verify plain-copy_bez-pecete.pdf --original sealed.pdf
+
+Input kind is auto-detected: SaaS evidence ZIP, Forensic Browser ZIP,
+PAdES-sealed PDF, or unsealed plain copy / report PDF.
 
 Exit codes:
     0  — all checks passed (or skipped)
     1  — at least one check failed
-    2  — invalid arguments / cannot read ZIP
+    2  — invalid arguments / cannot read input
+    3  — input is not verifiable by itself (unsealed copy without --original)
 """
 
 from __future__ import annotations
@@ -20,7 +26,8 @@ import sys
 from pathlib import Path
 from typing import TextIO
 
-from .core import VerifyReport, verify_evidence_zip
+from .core import VerifyReport
+from .dispatch import verify_bytes
 
 
 # ANSI colour helpers — NO_COLOR / non-TTY auto-disable
@@ -75,6 +82,8 @@ def _print_human(report: VerifyReport, stream: TextIO, colors: _Colors) -> None:
     s = report.summary
     if s.get("verdict") == "VERIFIED":
         verdict_line = f"{c.green}{c.bold}✓ VERIFIED{c.reset}"
+    elif s.get("verdict") == "NOT_VERIFIABLE":
+        verdict_line = f"{c.yellow}{c.bold}? NOT VERIFIABLE BY ITSELF{c.reset}"
     else:
         verdict_line = f"{c.red}{c.bold}✗ FAILED{c.reset}"
 
@@ -87,8 +96,12 @@ def _print_human(report: VerifyReport, stream: TextIO, colors: _Colors) -> None:
         file=stream,
     )
     print(file=stream)
+    for note in s.get("notes") or []:
+        print(f"  {c.dim}• {note}{c.reset}", file=stream)
+    if s.get("notes"):
+        print(file=stream)
 
-    if report.summary.get("verdict") != "VERIFIED":
+    if report.summary.get("verdict") == "FAILED":
         print(
             f"  {c.dim}For full details, re-run with --json | jq{c.reset}",
             file=stream,
@@ -100,16 +113,46 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="gpa-verify",
         description=(
-            "Independently verify a GetProofAnchor evidence bundle. "
-            "Reads ONLY the bundled ZIP — no network, no GetProofAnchor "
-            "servers required."
+            "Independently verify a GetProofAnchor evidence bundle (SaaS ZIP), "
+            "a Forensic Browser ZIP package, a PAdES-sealed Forensic Browser PDF "
+            "or an unsealed plain copy. Reads ONLY the given files — no network, "
+            "no GetProofAnchor servers required."
         ),
         epilog="https://github.com/getproofanchor/gpa-verify",
     )
     parser.add_argument(
         "zip_path",
         type=Path,
-        help="path to GetProofAnchor_Evidence_*.zip",
+        metavar="FILE",
+        help="evidence ZIP (SaaS or Forensic Browser) or Forensic Browser PDF",
+    )
+    parser.add_argument(
+        "--original",
+        type=Path,
+        metavar="FILE",
+        default=None,
+        help=(
+            "for an unsealed plain copy (…_bez-pecete.pdf): the sealed original "
+            "PDF it identifies; for an unsealed report.pdf: its ZIP package"
+        ),
+    )
+    parser.add_argument(
+        "--tsl",
+        action="append",
+        metavar="PATH",
+        default=[],
+        help=(
+            "EU Trusted List for sealed PDFs (which embed none): a TSL .xml, a "
+            "directory of them, or a Forensic Browser/SaaS ZIP whose "
+            "timestamp/tsl/*.xml is used. Repeatable."
+        ),
+    )
+    parser.add_argument(
+        "--certs",
+        action="append",
+        metavar="PEM",
+        default=[],
+        help="extra TSA CA certificates (PEM) for building the TSA chain. Repeatable.",
     )
     parser.add_argument(
         "--json",
@@ -154,7 +197,30 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: cannot read {args.zip_path}: {exc}", file=sys.stderr)
         return 2
 
-    report = verify_evidence_zip(zip_bytes, bitcoin_rpc=args.bitcoin_rpc)
+    original = None
+    for p in [args.original] if args.original else []:
+        if not p.is_file():
+            print(f"error: file not found: {p}", file=sys.stderr)
+            return 2
+    for p in list(args.tsl) + list(args.certs):
+        if not Path(p).exists():
+            print(f"error: file not found: {p}", file=sys.stderr)
+            return 2
+    try:
+        if args.original:
+            original = args.original.read_bytes()
+        _kind, report = verify_bytes(
+            zip_bytes,
+            original=original,
+            original_name=args.original.name if args.original else None,
+            tsl_paths=[str(p) for p in args.tsl],
+            cert_paths=[str(p) for p in args.certs],
+            bitcoin_rpc=args.bitcoin_rpc,
+        )
+    except OSError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    not_verifiable = report.summary.get("verdict") == "NOT_VERIFIABLE"
 
     if args.json:
         json.dump(report.to_dict(), sys.stdout, indent=2, ensure_ascii=False)
@@ -164,13 +230,18 @@ def main(argv: list[str] | None = None) -> int:
             for c in report.checks:
                 if not c.passed and not c.skipped:
                     print(f"FAIL  {c.name}: {c.detail}", file=sys.stderr)
+        elif not_verifiable:
+            print("NOT VERIFIABLE: unsealed copy — pass --original <sealed file>",
+                  file=sys.stderr)
     else:
         colors = _Colors(
             enabled=not args.no_color and _supports_color(sys.stdout)
         )
         _print_human(report, sys.stdout, colors)
 
-    return 0 if not report.any_failed else 1
+    if report.any_failed:
+        return 1
+    return 3 if not_verifiable else 0
 
 
 if __name__ == "__main__":

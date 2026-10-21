@@ -112,7 +112,38 @@ gpa-verify --json bundle.zip > report.json
 |------|---------|
 | 0    | All checks passed |
 | 1    | At least one check failed |
-| 2    | Invalid arguments / cannot read ZIP |
+| 2    | Invalid arguments / cannot read input |
+| 3    | Input is not verifiable by itself (unsealed plain copy without `--original`) |
+
+## Forensic Browser outputs
+
+`gpa-verify` also verifies the outputs of the GetProofAnchor **Forensic
+Browser** desktop app. The input kind is detected automatically:
+
+```bash
+gpa-verify GetProofAnchor_sess-1792572420814.zip            # ZIP package
+gpa-verify GetProofAnchor_sess-1792572400480.pdf            # PAdES-sealed PDF
+gpa-verify GetProofAnchor_sess-1792572400480.pdf --tsl EE.xml   # + qualified status
+gpa-verify GetProofAnchor_sess-1792572400480_bez-pecete.pdf \
+           --original GetProofAnchor_sess-1792572400480.pdf # unsealed copy vs. original
+```
+
+| Input | What a `VERIFIED` verdict proves |
+|-------|----------------------------------|
+| **ZIP package** (`getproofanchor-lite-2`) | Every file matches `manifest.json`; every *sealed* file (screenshots, HTML, HAR, DNS, capture metadata, `proof.json`, optional MHTML/video — one `pages/NN/` directory per captured page) matches the hash listed in `timestamp/eidas_payload.json`, whose SHA-256 is the message imprint of the qualified RFC 3161 token `timestamp/eidas.tsr`. The token signature, signed attributes, TSA certificate chain and the TSA's *granted* status at genTime in the bundled EU Trusted List are checked. Unsealed files (report, token, certificates, TSL snapshot) are reported as such. |
+| **Sealed PDF** (PAdES document time-stamp, `/ETSI.RFC3161`) | The `/ByteRange` covers the whole file except the `/Contents` value; the embedded qualified time-stamp's imprint equals the hash of those bytes, so the report **and every embedded artefact** (`/EmbeddedFiles`) existed in this exact form at genTime. Each attachment is listed with its SHA-256 and compared to the embedded `manifest.json` and `proof.json`. Any revision appended after the time-stamp is classified: Document Security Store / VRI / further document time-stamps are permitted (LTV); anything else is reported as **modified after sealing**, with the byte length and SHA-256 of the sealed version. |
+| **Plain copy** (`*_bez-pecete.pdf`, unsealed) | Alone: nothing — it is reported as `NOT VERIFIABLE BY ITSELF` (exit 3) together with the identification it carries (sealed file name, SHA-256, session id, time-stamp serial and time, read from its QR code and printed text). With `--original`: the original is fully verified, and the copy's identification data must match it exactly. It is **not** proven that the copy's pages are a faithful rendering of the original. |
+
+Sealed PDFs embed no Trusted List, so the TSA's qualified status is
+reported as *not checked offline* unless you pass `--tsl` (a Trusted List
+`.xml`, a directory of them, or any Forensic Browser/SaaS ZIP — its
+`timestamp/tsl/*.xml` and TSA certificates are used). `--certs PEM` adds
+TSA CA certificates for chain building.
+
+The formats are documented in
+[docs/forensic-browser-formats.md](docs/forensic-browser-formats.md).
+The PDF parser and the QR-code reader are small pure-Python modules —
+no extra dependencies.
 
 ## What it actually checks
 
@@ -211,6 +242,13 @@ It does **not** verify:
   the job of a qualified examiner.
 
 ## API
+
+```python
+from gpa_verify import verify_bytes
+
+kind, report = verify_bytes(open("any-output.pdf", "rb").read())
+print(kind, report.summary["verdict"])   # e.g. "sealed_pdf VERIFIED"
+```
 
 ```python
 from gpa_verify import verify_evidence_zip

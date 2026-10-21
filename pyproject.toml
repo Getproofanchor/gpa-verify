@@ -57,6 +57,7 @@ packages = ["src/gpa_verify"]
 include = [
     "/src",
     "/tests",
+    "/docs",
     "/README.md",
     "/LICENSE",
     "/CHANGELOG.md",
@@ -68,4 +69,5 @@ include = [
 # stays lean (verification code only).
 exclude = [
     "/tests/fixtures/*.zip",
+    "/tests/fixtures/forensic_browser/*",
 ]
