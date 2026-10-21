@@ -713,6 +713,26 @@ def _analyze_post_seal(doc: P.PDFDocument, sealed_end: int, sigs: List[_Sig]) ->
                                "classified": "object number listed twice in one xref section"})
 
     dss_struct, dss_streams, dss_problems = _collect_dss(doc, doc.root.get("DSS"))
+    # LTV renewal (e.g. pyHanko ltaupdate) re-points VRI keys at new
+    # dictionaries; the superseded DSS objects of earlier post-seal revisions
+    # stay in the file unreferenced. Accept them if they were DSS structure in
+    # their own revision and are unchanged since (review round 3, B1).
+    for sec in later[:-1] if len(later) > 1 else []:
+        if sec.end <= 0 or len(later) > 32:
+            continue
+        try:
+            rdoc = P.PDFDocument(data[:sec.end])
+        except P.PDFError:
+            continue
+        r_struct, r_streams, r_probs = _collect_dss(rdoc, rdoc.root.get("DSS"))
+        if r_probs:
+            continue
+        for n in r_struct:
+            if n not in dss_struct and _same(_safe_get(rdoc, n), _safe_get(doc, n)):
+                dss_struct.add(n)
+        for n in r_streams:
+            if n not in dss_streams and _same(_safe_get(rdoc, n), _safe_get(doc, n)):
+                dss_streams.add(n)
     later_sig_nums = {s.num for s in sigs if s.end > sealed_end and s.num is not None}
     xref_stream_offsets = {s.offset for s in later if s.kind == "stream"}
     root_num = doc.trailer["Root"].num if isinstance(doc.trailer.get("Root"), P.Ref) else None
@@ -950,7 +970,9 @@ def _classify_change(ctx: "_Ctx", num: int, obj: Any, old: Any) -> Tuple[bool, s
     if not diff:
         return True, "rewritten (identical)"
     if num == ctx.root_num:
-        bad = diff - {"DSS", "AcroForm", "Extensions"}
+        bad = diff - {"DSS", "AcroForm", "Extensions", "Version"}
+        if "Version" in diff and not _version_bump_ok(old.get("Version"), obj.get("Version")):
+            bad.add("Version")
         if bad:
             return False, "catalog changed: " + ",".join(sorted(bad))
         if "AcroForm" in diff:
@@ -979,6 +1001,16 @@ def _classify_change(ctx: "_Ctx", num: int, obj: Any, old: Any) -> Tuple[bool, s
         ok, why = _acroform_ok(ctx, old, obj)
         return (True, "AcroForm fields (time-stamp)") if ok else (False, "AcroForm changed: " + why)
     return False, "changed object: " + ",".join(sorted(diff))
+
+
+def _version_bump_ok(old: Any, new: Any) -> bool:
+    """Catalog /Version may only be raised (LTV writers set 1.7+)."""
+    try:
+        o = tuple(int(x) for x in str(old).split(".")) if old is not None else (1, 0)
+        n = tuple(int(x) for x in str(new).split("."))
+    except (TypeError, ValueError):
+        return False
+    return isinstance(new, P.Name) and n >= o and n <= (2, 0)
 
 
 def _extensions_ok(x: Any) -> bool:

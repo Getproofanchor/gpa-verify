@@ -28,8 +28,12 @@
   (Certs/CRLs/OCSPs/VRI → new streams), new document time-stamps with
   invisible, action-free widgets, and the matching catalog/AcroForm/page
   `/Annots` changes. Rewritten sealed streams (whatever their `/Type`),
-  objects not listed in any xref section, an xref chain skipping the sealed
-  revision and a replaced `/Root` are reported as modifications.
+  objects not listed in any xref section, an object listed twice in one xref
+  section, changed generation numbers, duplicate dictionary keys after the
+  seal, an xref chain skipping the sealed revision and a replaced `/Root` are
+  reported as modifications. Superseded DSS/VRI objects from earlier LTV
+  revisions (archival time-stamp renewal) and a raised catalog `/Version`
+  are accepted; real SK-sealed samples renewed with pyHanko verify.
 - **Resource limits for hostile input**: linear signature scan (≤ 64
   signature dictionaries), bounded FlateDecode (64 MB per stream, 256 MB per
   document), validated predictor parameters and xref-stream /W, ZIP member

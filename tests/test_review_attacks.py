@@ -482,3 +482,44 @@ def test_object_listed_twice_in_one_section_is_rejected(sealed):
     upd = upd[:i] + line + upd[i:]
     r = _post_seal(verify_sealed_pdf(upd))
     assert not r.passed and "listed twice" in str(r.extra)
+
+
+def _dss_rev(data, doc_root, dss_num, vri_num, cert_num, root_num=3):
+    root = dict(doc_root)
+    root["DSS"] = P.Ref(dss_num, 0)
+    return _update(data, {
+        cert_num: _stream(b"0\x82cert%d" % cert_num),
+        vri_num: b"<</Cert[" + str(cert_num).encode() + b" 0 R]>>",
+        dss_num: b"<</Type/DSS/Certs[" + str(cert_num).encode() + b" 0 R]/VRI<</ABCD "
+                 + str(vri_num).encode() + b" 0 R>>>>",
+        root_num: _ser(root),
+    })
+
+
+def test_superseded_vri_from_earlier_ltv_revision_verifies(sealed):
+    """Review round 3 B1: LTV renewal re-points a VRI key; the old VRI dict
+    stays unreferenced and must not make the file fail."""
+    data, doc = sealed
+    r2 = _dss_rev(data, doc.root, 48, 49, 47)
+    d2 = P.PDFDocument(r2)
+    r3 = _dss_rev(r2, d2.root, 52, 51, 50)
+    rep = verify_sealed_pdf(r3)
+    assert _post_seal(rep).passed, _post_seal(rep).detail
+
+
+def test_superseded_dss_object_redefined_later_fails(sealed):
+    data, doc = sealed
+    r2 = _dss_rev(data, doc.root, 48, 49, 47)
+    d2 = P.PDFDocument(r2)
+    r3 = _dss_rev(r2, d2.root, 52, 51, 50)
+    r4 = _update(r3, {49: b"<</Type/Page/Contents 47 0 R>>"})
+    assert not _post_seal(verify_sealed_pdf(r4)).passed
+
+
+def test_catalog_version_bump_allowed_but_not_down(sealed):
+    data, doc = sealed
+    root = dict(doc.root)
+    root["Version"] = P.Name("2.0")
+    assert _post_seal(verify_sealed_pdf(_update(data, {3: _ser(root)}))).passed
+    root["Version"] = P.Name("1.4")
+    assert not _post_seal(verify_sealed_pdf(_update(data, {3: _ser(root)}))).passed
