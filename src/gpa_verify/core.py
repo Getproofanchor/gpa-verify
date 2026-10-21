@@ -56,6 +56,23 @@ Verification layers (each tightens forensic claim):
   Layer 8  TLS chain validity    — leaf_cert.pem subject + SAN consistent
                                    with network/tls.json claim; chain
                                    resolves to a public CA.
+  Layer 9  Anchor witness        — chain/anchor_witness.jsonl links the
+                                   proof's chain entry to the anchored head.
+                                   INFORMATIONAL since 1.6.0: the witness
+                                   carries hashes that cannot be recomputed
+                                   from the bundle, so it is not proof that
+                                   the Bitcoin anchor covers this evidence.
+  Layer 11 Anchor inclusion (1.6.0) — anchor/inclusion.json (anchor v3):
+                                   recomputes the proof's Merkle leaf from
+                                   timestamp/eidas_payload.json, walks the
+                                   RFC 6962 audit path to merkle_root, checks
+                                   that the v3 anchor payload commits to that
+                                   root and that the OTS receipt commits to
+                                   the anchor payload. Skipped (not failed)
+                                   on bundles without inclusion.json.
+                                   Catches: a Bitcoin anchor that does not
+                                   cover this evidence; grafted inclusion
+                                   proofs; edited eIDAS payloads.
 
 After all layers pass, the verdict is: this evidence existed in this
 exact form before the eIDAS timestamp's gen_time, was sealed by a
@@ -68,6 +85,7 @@ artifacts — no GetProofAnchor server needed.
 from __future__ import annotations
 
 import hashlib
+import re
 import io
 import json
 import zipfile
@@ -557,6 +575,33 @@ def check_chain_integrity(zf: zipfile.ZipFile) -> CheckResult:
 # Layer 4 — eIDAS qualified timestamp signature
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _declares_eidas(zf: zipfile.ZipFile, manifest: Dict[str, Any]) -> Optional[str]:
+    """Where the bundle declares a qualified timestamp, or None.
+
+    Same rule as the GetProofAnchor online verifier (_declares_eidas) plus
+    timestamp/eidas_meta.json status "ok" and a manifest entry for the token.
+    The mere presence of timestamp/eidas_payload.json is NOT a declaration:
+    bundles of proofs without a qualified timestamp also carry it.
+    """
+    proof = _read_zip_json(zf, "proof.json") or {}
+    pe = proof.get("eidas") if isinstance(proof.get("eidas"), dict) else {}
+    me = manifest.get("eidas") if isinstance(manifest.get("eidas"), dict) else {}
+    st = proof.get("status") if isinstance(proof.get("status"), dict) else {}
+    if pe.get("status") == "ok" or pe.get("present") is True:
+        return "proof.json eidas"
+    if me.get("status") == "ok" or me.get("present") is True:
+        return "manifest.json eidas"
+    if st.get("eidas_ok") is True:
+        return "proof.json status.eidas_ok"
+    meta = _read_zip_json(zf, "timestamp/eidas_meta.json") or {}
+    if meta.get("status") == "ok":
+        return "timestamp/eidas_meta.json"
+    files = manifest.get("files") if isinstance(manifest.get("files"), dict) else {}
+    if "timestamp/eidas.tsr" in files:
+        return "manifest.json files"
+    return None
+
+
 def check_eidas_signature(
     zf: zipfile.ZipFile,
     manifest: Dict[str, Any],
@@ -577,6 +622,20 @@ def check_eidas_signature(
     tsr_bytes = _read_zip_file(zf, "timestamp/eidas.tsr")
     payload_bytes = _read_zip_file(zf, "timestamp/eidas_payload.json")
     if tsr_bytes is None or payload_bytes is None:
+        # 1.6.0: a bundle that DECLARES a qualified timestamp but lacks the
+        # token (or the stamped payload) must not verify — removing
+        # timestamp/eidas.tsr would otherwise turn every eIDAS check into a
+        # SKIP and let edited content pass (mirrors the server's
+        # "timestamp_missing" / "payload_missing" errors).
+        declared = _declares_eidas(zf, manifest)
+        if declared:
+            missing = "timestamp/eidas.tsr" if tsr_bytes is None else "timestamp/eidas_payload.json"
+            return CheckResult(
+                name="eidas_signature",
+                passed=False,
+                detail=f"bundle declares a qualified eIDAS timestamp ({declared}) but {missing} is missing",
+                extra={"declared_by": declared, "missing": missing},
+            )
         return CheckResult(
             name="eidas_signature",
             passed=False,
@@ -757,6 +816,21 @@ def check_eidas_signature(
                 name="eidas_signature",
                 passed=False,
                 detail=f"unsupported sig algo: {sig_algo}",
+            )
+
+        # The signature covers signed_attrs only; bind them to the TSTInfo
+        # actually present (RFC 5652 §5.4 messageDigest). Without this an
+        # altered TSTInfo (imprint, genTime) would pass with a valid signature.
+        md_attr = next(
+            (a["values"][0].native for a in signed_attrs
+             if a["type"].native == "message_digest"),
+            None,
+        )
+        if md_attr is None or md_attr != hashlib.new(digest_algo, econtent).digest():
+            return CheckResult(
+                name="eidas_signature",
+                passed=False,
+                detail="signed messageDigest does not match TSTInfo — token content altered after signing",
             )
 
         # All passed
@@ -1273,6 +1347,16 @@ def check_file_digest(zf: zipfile.ZipFile) -> CheckResult:
     return CheckResult(name="file_digest", passed=True, detail=detail)
 
 
+_WITNESS_PREFIX = "informational (not independently recomputable): "
+_WITNESS_INFO = {
+    "informational": True,
+    "independently_recomputable": False,
+    "note": ("The witness carries (seq, prev_hash, entry_hash) only; entry hashes cannot be "
+             "recomputed from the bundle, so this is not proof that the Bitcoin anchor covers "
+             "this evidence. See anchor_inclusion (anchor v3)."),
+}
+
+
 def check_anchor_witness(zf: zipfile.ZipFile) -> CheckResult:
     """The proof's chain entry must link to the head the OTS anchor covers.
 
@@ -1306,7 +1390,8 @@ def check_anchor_witness(zf: zipfile.ZipFile) -> CheckResult:
         return CheckResult(
             name="anchor_witness",
             passed=True,
-            detail=f"proof entry (seq {head.get('seq')}) is itself the anchored head",
+            detail=f"{_WITNESS_PREFIX}proof entry (seq {head.get('seq')}) is itself the anchored head",
+            extra=dict(_WITNESS_INFO),
         )
 
     raw = _read_zip_text(zf, "chain/anchor_witness.jsonl")
@@ -1373,16 +1458,33 @@ def check_anchor_witness(zf: zipfile.ZipFile) -> CheckResult:
             name="anchor_witness",
             passed=False,
             detail="witness does not terminate at the anchored head",
-            extra={"reached": cursor, "anchored_head": anchored},
+            extra={"reached": cursor, "anchored_head": anchored, **_WITNESS_INFO},
+        )
+
+    # 1.6.0: the last step must BE the anchored entry. A short witness whose
+    # last entry_hash merely equals the anchored head does not link. Skip,
+    # never fail: the witness is informational and cannot change a verdict.
+    last_seq = steps[-1].get("seq") if steps else None
+    if last_seq != anchor.get("seq"):
+        return CheckResult(
+            name="anchor_witness",
+            passed=False,
+            skipped=True,
+            detail=(
+                f"{_WITNESS_PREFIX}last witness seq ({last_seq}) does not equal the anchored seq "
+                f"({anchor.get('seq')}) — the witness does not link this proof to the anchor"
+            ),
+            extra={"last_witness_seq": last_seq, "anchor_seq": anchor.get("seq"), **_WITNESS_INFO},
         )
 
     return CheckResult(
         name="anchor_witness",
         passed=True,
         detail=(
-            f"{len(steps)} witness entries link this proof (seq {head.get('seq')}) "
+            f"{_WITNESS_PREFIX}{len(steps)} witness entries link this proof (seq {head.get('seq')}) "
             f"to the anchored head (seq {anchor.get('seq')})"
         ),
+        extra=dict(_WITNESS_INFO),
     )
 
 
@@ -1640,6 +1742,284 @@ def check_tsl_qualified(zf: zipfile.ZipFile, manifest: Dict[str, Any]) -> CheckR
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Anchor v3 — Merkle inclusion proof (1.6.0)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Must stay identical to the GetProofAnchor server verifier
+# (api/app/services/verify_zip_checks.py::check_anchor_inclusion) and to the
+# reference script api/tools/verify_anchor_inclusion.py.
+
+ANCHOR_LEAF_ALGO = "gpa-anchor-leaf-v3"
+INCLUSION_FILE = "anchor/inclusion.json"
+_INCLUSION_PAYLOAD_FILES = ("anchor/anchor_payload.json", "anchor/inclusion_anchor_payload.json")
+_INCLUSION_RECEIPT_FILES = ("anchor/anchor_receipt.ots", "anchor/inclusion_anchor_receipt.ots")
+_OTS_MAGIC = b"\x00OpenTimestamps\x00\x00Proof\x00\xbf\x89\xe2\xe8\x84\xe8\x92\x94"
+
+
+_HEX64_RE = re.compile(r"[0-9a-f]{64}")
+_OTS_ATTESTATION_TAGS = {
+    bytes.fromhex("0588960d73d71901"): "bitcoin",
+    bytes.fromhex("83dfe30d2ef90c8e"): "pending",
+    bytes.fromhex("06869a0d73d71b45"): "litecoin",
+}
+
+
+def _is_hex64(s: Any) -> bool:
+    """Exactly 64 LOWERCASE hex characters (bytes.fromhex would skip spaces)."""
+    return isinstance(s, str) and _HEX64_RE.fullmatch(s) is not None
+
+
+def _valid_proof_id(pid: Any) -> bool:
+    if not isinstance(pid, str) or not 0 < len(pid) <= 64 or "\x00" in pid:
+        return False
+    try:
+        pid.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def anchor_leaf_v3(proof_id: str, eidas_payload_sha256_hex: str) -> bytes:
+    """leaf = SHA256("gpa-anchor-leaf-v3\\0" || proof_id || "\\0" || payload digest)."""
+    if not _valid_proof_id(proof_id) or not _is_hex64(eidas_payload_sha256_hex):
+        raise ValueError("invalid proof_id or payload digest")
+    return hashlib.sha256(
+        b"gpa-anchor-leaf-v3\x00" + proof_id.encode("utf-8") + b"\x00"
+        + bytes.fromhex(eidas_payload_sha256_hex)
+    ).digest()
+
+
+def merkle_root_from_path(leaf: bytes, index: Any, tree_size: Any,
+                          path: Any) -> Optional[bytes]:
+    """RFC 9162 §2.1.3.2 inclusion verification over an RFC 6962 tree
+    (leaf node = SHA256(0x00||leaf), inner = SHA256(0x01||l||r)).
+
+    `path` is ordered leaf → root, each element {"side": "L"|"R", "hash"};
+    side is where the sibling sits and must agree with (index, tree_size).
+    Returns the computed root, or None when the path is inconsistent.
+    """
+    if type(index) is not int or type(tree_size) is not int:
+        return None
+    if not 0 <= index < tree_size or not isinstance(path, list):
+        return None
+    H = lambda b: hashlib.sha256(b).digest()  # noqa: E731
+    fn, sn = index, tree_size - 1
+    r = H(b"\x00" + leaf)
+    for el in path:
+        if not isinstance(el, dict) or not _is_hex64(el.get("hash")) or el.get("side") not in ("L", "R"):
+            return None
+        p = bytes.fromhex(el["hash"])
+        if sn == 0:
+            return None
+        if (fn & 1) or fn == sn:
+            if el["side"] != "L":
+                return None
+            r = H(b"\x01" + p + r)
+            if not (fn & 1):
+                while fn != 0 and not (fn & 1):
+                    fn >>= 1
+                    sn >>= 1
+        else:
+            if el["side"] != "R":
+                return None
+            r = H(b"\x01" + r + p)
+        fn >>= 1
+        sn >>= 1
+    return r if sn == 0 else None
+
+
+def _receipt_state(receipt: bytes, digest_hex: str) -> str:
+    """"commits" | "mismatch" | "receipt_unparsed" | "receipt_no_attestation"
+    (same rule as the server: header for sha256 + at least one attestation)."""
+    pos = len(_OTS_MAGIC)
+    if (not receipt.startswith(_OTS_MAGIC) or len(receipt) < pos + 34
+            or receipt[pos] != 0x01 or receipt[pos + 1] != 0x08):
+        return "receipt_unparsed"
+    if receipt[pos + 2:pos + 34].hex() != digest_hex:
+        return "mismatch"
+    tail = receipt[pos + 34:]
+    if not any(tag in tail for tag in _OTS_ATTESTATION_TAGS):
+        return "receipt_no_attestation"
+    return "commits"
+
+
+def check_anchor_inclusion(
+    zf: zipfile.ZipFile,
+    manifest: Dict[str, Any],
+    eidas_check: Optional[CheckResult] = None,
+    bitcoin_rpc: Optional[str] = None,
+) -> CheckResult:
+    """anchor/inclusion.json: is this proof's eIDAS-stamped payload a leaf of
+    the Merkle tree committed by the OpenTimestamps anchor?
+
+    extra["result"] (same values as the GetProofAnchor online verifier):
+      "verified"     PASS — content ↔ eIDAS payload (whose qualified timestamp
+                     verified in eidas_signature: signature + imprint) ↔ leaf ↔
+                     Merkle root ↔ anchor payload ↔ OTS receipt digest all hold.
+                     Bitcoin block confirmation is a SEPARATE result
+                     (extra["bitcoin_verification"], with --bitcoin-rpc).
+      "unverifiable" SKIP — consistent, but the receipt is unparsable / has no
+                     attestation, or the eIDAS timestamp of this payload did
+                     not verify (extra["reasons"]).
+      "not_present"  SKIP — no inclusion.json (older bundles).
+      "failed"       FAIL — an inconsistency.
+    """
+    name = "anchor_inclusion"
+    raw = _read_zip_file(zf, INCLUSION_FILE)
+    if raw is None:
+        return CheckResult(
+            name=name, passed=False, skipped=True,
+            detail=("no anchor/inclusion.json — bundle predates anchor v3, or the proof was not yet "
+                    "included in an anchor (or has no qualified timestamp); the Bitcoin anchor's binding "
+                    "to this evidence cannot be shown from the bundle. The eIDAS qualified timestamp "
+                    "is unaffected."),
+            extra={"result": "not_present"},
+        )
+
+    failures: List[str] = []
+    reasons: List[str] = []
+    checks: Dict[str, Any] = {}
+    extra: Dict[str, Any] = {"result": "failed", "checks": checks, "failures": failures, "reasons": reasons}
+
+    def done(detail_ok: str = "") -> CheckResult:
+        if failures:
+            extra["result"] = "failed"
+            return CheckResult(name=name, passed=False, detail=failures[0], extra=extra)
+        if reasons:
+            extra["result"] = "unverifiable"
+            return CheckResult(
+                name=name, passed=False, skipped=True,
+                detail="inclusion proof is consistent but NOT verified: " + ", ".join(reasons),
+                extra=extra,
+            )
+        extra["result"] = "verified"
+        return CheckResult(name=name, passed=True, detail=detail_ok, extra=extra)
+
+    try:
+        inc = json.loads(raw.decode("utf-8"))
+    except Exception:
+        inc = None
+    if not isinstance(inc, dict):
+        failures.append("anchor/inclusion.json is unreadable or not a JSON object")
+        return done()
+
+    pid = inc.get("proof_id")
+    if not _valid_proof_id(pid):
+        failures.append("inclusion proof_id is not a valid identifier")
+        return done()
+    checks["proof_id_matches_manifest"] = pid == manifest.get("proof_id")
+    if not checks["proof_id_matches_manifest"]:
+        failures.append("inclusion proof_id differs from manifest proof_id")
+        return done()
+    if inc.get("leaf_algo") != ANCHOR_LEAF_ALGO:
+        failures.append("unsupported leaf_algo")
+        return done()
+
+    ep = _read_zip_file(zf, "timestamp/eidas_payload.json")
+    if ep is None:
+        failures.append("timestamp/eidas_payload.json missing — the leaf cannot be recomputed")
+        return done()
+    ep_sha = _sha256(ep)
+    extra["eidas_payload_sha256"] = ep_sha
+    checks["eidas_payload_sha256_matches"] = ep_sha == inc.get("eidas_payload_sha256")
+    if not checks["eidas_payload_sha256_matches"]:
+        failures.append("SHA-256 of timestamp/eidas_payload.json differs from inclusion.eidas_payload_sha256")
+    try:
+        ep_obj = json.loads(ep.decode("utf-8"))
+    except Exception:
+        ep_obj = None
+    if isinstance(ep_obj, dict) and "proof_id" in ep_obj:
+        checks["eidas_payload_proof_id_matches"] = ep_obj.get("proof_id") == pid
+        if not checks["eidas_payload_proof_id_matches"]:
+            failures.append("timestamp/eidas_payload.json proof_id differs from inclusion proof_id")
+
+    leaf = anchor_leaf_v3(pid, ep_sha)
+    extra["leaf_hash"] = leaf.hex()
+    checks["leaf_hash_matches"] = leaf.hex() == inc.get("leaf_hash")
+    if not checks["leaf_hash_matches"]:
+        failures.append("recomputed leaf differs from inclusion leaf_hash")
+
+    idx, cnt, root = inc.get("leaf_index"), inc.get("leaf_count"), inc.get("merkle_root")
+    computed = merkle_root_from_path(leaf, idx, cnt, inc.get("audit_path"))
+    checks["audit_path_valid"] = computed is not None and _is_hex64(root) and computed.hex() == root
+    if not checks["audit_path_valid"]:
+        failures.append("audit path does not lead from the recomputed leaf to merkle_root")
+    extra.update({"leaf_index": idx, "leaf_count": cnt, "merkle_root": root})
+
+    ap = inc.get("anchor_payload")
+    if not isinstance(ap, dict):
+        failures.append("anchor_payload missing in inclusion.json")
+        return done()
+    checks["anchor_payload_commits_root"] = (
+        ap.get("v") == 3 and ap.get("merkle_root") == root and ap.get("leaf_count") == cnt
+        and ap.get("leaf_algo") == ANCHOR_LEAF_ALGO
+    )
+    if not checks["anchor_payload_commits_root"]:
+        failures.append("anchor_payload does not commit to this merkle_root / leaf_count / leaf_algo")
+    ap_bytes = _canonical_json_bytes(ap)
+    ap_sha = _sha256(ap_bytes)
+    extra["anchor_payload_sha256"] = ap_sha
+    checks["anchor_payload_sha256_matches"] = ap_sha == inc.get("anchor_payload_sha256")
+    if not checks["anchor_payload_sha256_matches"]:
+        failures.append("SHA-256 of canonical anchor_payload differs from anchor_payload_sha256")
+    pf = inc.get("anchor_payload_file")
+    if pf not in _INCLUSION_PAYLOAD_FILES:
+        failures.append("anchor_payload_file is not a recognised path")
+    else:
+        checks["anchor_payload_file_matches"] = _read_zip_file(zf, pf) == ap_bytes
+        if not checks["anchor_payload_file_matches"]:
+            failures.append(f"{pf} is missing or is not the canonical anchor_payload bytes")
+
+    rf = inc.get("anchor_receipt_file")
+    receipt = _read_zip_file(zf, rf) if rf in _INCLUSION_RECEIPT_FILES else None
+    if receipt is None:
+        failures.append("anchor receipt referenced by inclusion.json is missing")
+        return done()
+    extra["receipt_file"] = rf
+    rstate = _receipt_state(receipt, ap_sha)
+    extra["receipt"] = rstate
+    checks["receipt_commits_anchor_payload"] = rstate == "commits"
+    if rstate == "mismatch":
+        failures.append("the OpenTimestamps receipt does not commit to the anchor payload")
+    elif rstate != "commits":
+        reasons.append(rstate)
+
+    # The payload must be the one the qualified timestamp actually covers.
+    eidas_ok = bool(eidas_check is not None and eidas_check.passed and not eidas_check.skipped)
+    checks["eidas_timestamp_verified_for_payload"] = eidas_ok
+    if not eidas_ok:
+        reasons.append("eidas_timestamp_not_verified")
+
+    # Bitcoin confirmation of the CONTENT anchor's receipt (review S2).
+    extra["bitcoin_attestation_verified"] = False
+    if bitcoin_rpc and not failures and rstate == "commits":
+        btc = _bitcoin_verify_via_node(receipt, bitcoin_rpc)
+        heights = btc.get("verified_heights") or []
+        if btc.get("deps_missing"):
+            extra["bitcoin_verification"] = "skipped_deps_missing"
+        elif heights and not btc.get("errors"):
+            extra["bitcoin_verification"] = "node_confirmed"
+            extra["bitcoin_attestation_verified"] = True
+            extra["verified_block_heights"] = heights
+            extra["block_times"] = btc.get("block_times")
+        elif btc.get("bitcoin_attestations") and btc.get("errors"):
+            extra["bitcoin_verification"] = "node_failed"
+            extra["bitcoin_errors"] = btc.get("errors")
+            failures.append(f"content anchor receipt {rf}: Bitcoin node verification FAILED")
+        else:
+            extra["bitcoin_verification"] = "pending_no_block_attestation"
+            extra["online_errors"] = btc.get("errors")
+
+    btc_note = (f"; Bitcoin-confirmed via own node in block(s) {extra.get('verified_block_heights')}"
+                if extra.get("bitcoin_attestation_verified") else
+                f"; Bitcoin block confirmation not checked — use --bitcoin-rpc or: ots verify -f {pf} {rf}")
+    return done(
+        f"content ↔ eIDAS payload (verified timestamp) ↔ leaf {idx} of {cnt} ↔ Merkle root ↔ anchor "
+        f"{ap_sha[:16]}... ↔ receipt digest ({rf}){btc_note}"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Public entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1694,6 +2074,16 @@ def verify_evidence_zip(
     report.checks.append(check_file_digest(zf))
     report.checks.append(check_anchor_witness(zf))
     report.checks.append(check_tls_evidence(zf))
+    _eidas = next((c for c in report.checks if c.name == "eidas_signature"), None)
+    try:
+        report.checks.append(check_anchor_inclusion(                 # 1.6.0 — appended last
+            zf, manifest, eidas_check=_eidas, bitcoin_rpc=bitcoin_rpc))
+    except Exception as exc:  # crafted input must never crash the verifier
+        report.checks.append(CheckResult(
+            name="anchor_inclusion", passed=False,
+            detail=f"inclusion proof could not be checked ({type(exc).__name__})",
+            extra={"result": "failed"},
+        ))
 
     # Build summary
     report.summary = {
@@ -1705,6 +2095,10 @@ def verify_evidence_zip(
             "VERIFIED"
             if report.all_passed and not report.any_failed
             else "FAILED"
+        ),
+        # 1.6.0 (additive): anchor v3 content binding — verified / not_present / failed
+        "anchor_inclusion": next(
+            (c.extra.get("result") for c in report.checks if c.name == "anchor_inclusion"), None
         ),
     }
     return report

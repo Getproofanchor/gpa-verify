@@ -180,6 +180,44 @@ client](https://opentimestamps.org/) for that.)
 claim. Confirms the TLS leaf certificate stored in the bundle is the
 same one observed at capture time.
 
+### Anchor witness (informational)
+
+`chain/anchor_witness.jsonl` links this proof's chain entry to the chain
+head covered by the OpenTimestamps anchor; since 1.6.0 the last witness
+`seq` must equal the anchored `seq`. The witness carries only
+`(seq, prev_hash, entry_hash)` and those hashes cannot be recomputed from
+the bundle, so this check is **informational** — it is not proof that the
+Bitcoin anchor covers the evidence, and it never fails a bundle on its own
+account beyond detecting an inconsistent witness.
+
+### Anchor inclusion (anchor v3, since 1.6.0)
+
+Bundles generated since 2026-10-21 carry `anchor/inclusion.json` once the
+proof has been included in an anchor — normally within minutes of the
+qualified timestamp; older downloads do not gain it (re-download). The check
+recomputes
+
+    leaf = SHA256("gpa-anchor-leaf-v3" 0x00 proof_id 0x00 SHA256(timestamp/eidas_payload.json))
+
+walks the RFC 6962 audit path (leaf node `SHA256(0x00‖leaf)`, inner node
+`SHA256(0x01‖left‖right)`, verified per RFC 9162 §2.1.3.2 with
+`leaf_index` / `leaf_count`) to `merkle_root`, and confirms that the v3
+anchor payload commits to that root, that SHA-256 of the canonical anchor
+payload equals `anchor_payload_sha256` and the shipped payload file, and
+that the `.ots` receipt header names that digest and carries an attestation.
+
+**`verified` (PASS) means exactly:** content ↔ eIDAS payload whose qualified
+timestamp verified in `eidas_signature` (signature, messageDigest, imprint) ↔
+Merkle root ↔ OTS receipt digest. Bitcoin block confirmation of the content
+anchor's receipt is a **separate** result (`extra.bitcoin_verification`, only
+with `--bitcoin-rpc`; or run `ots verify -f <anchor payload file> <receipt>`).
+That GetProofAnchor issued the anchor is shown only by the online verifier's
+anchor registry.
+
+Results: `verified` (PASS), `unverifiable` (SKIP — unparsable or
+attestation-less receipt, or the payload's qualified timestamp did not
+verify; see `extra.reasons`), `not_present` (SKIP), `failed` (FAIL).
+
 ## Threat model
 
 `gpa-verify` defends against the following attacks:
@@ -194,6 +232,8 @@ same one observed at capture time.
 | Substitute anchor for a different chain | Layer 5 |
 | Substitute OTS receipt | Layer 6 |
 | Substitute leaf TLS cert | Layer 7 |
+| Fabricated chain witness (hashes only) | Anchor witness (last seq must equal anchored seq; informational) |
+| Graft another proof's inclusion proof / edit eIDAS payload under a v3 anchor | Anchor inclusion |
 
 It does **not** verify:
 

@@ -1,5 +1,71 @@
 # Changelog
 
+## [1.6.0] — 2026-10-21
+
+### Security
+
+- **Removing `timestamp/eidas.tsr` no longer yields VERIFIED** (pre-existing
+  since ≤ 1.5.0). A bundle that declares a qualified timestamp
+  (`proof.json` `eidas.status == "ok"`/`present`, `manifest.json` `eidas`,
+  `status.eidas_ok`, `timestamp/eidas_meta.json` status `ok`, or a manifest
+  entry for the token) but lacks the token or the stamped payload now FAILS
+  `eidas_signature`, matching the GetProofAnchor online verifier
+  (`timestamp_missing`). Bundles of proofs without a qualified timestamp
+  (they carry `eidas_payload.json` but declare nothing) keep their verdict.
+- **`eidas_signature` now checks the signed `messageDigest` attribute against
+  the encapsulated TSTInfo** (RFC 5652 §5.4). A re-encoded TSTInfo with a
+  forged message imprint kept a valid signature and passed.
+- **The anchor witness is no longer treated as proof of Bitcoin anchoring.**
+  `chain/anchor_witness.jsonl` carries `(seq, prev_hash, entry_hash)` only;
+  entry hashes cannot be recomputed from the bundle. The last witness `seq`
+  must now equal the anchored `seq` (otherwise SKIP with `last_witness_seq` /
+  `anchor_seq`), and every result is labelled "informational (not
+  independently recomputable)" (`extra.informational = true`,
+  `extra.independently_recomputable = false`). No bundle that verified with
+  1.5.0 fails because of this change.
+
+### Added
+
+- `anchor_inclusion` check (anchor v3). PASS (`extra.result = "verified"`)
+  means exactly: content ↔ eIDAS payload whose qualified timestamp verified in
+  `eidas_signature` ↔ leaf
+  `SHA256("gpa-anchor-leaf-v3" 0x00 proof_id 0x00 SHA256(timestamp/eidas_payload.json))`
+  ↔ RFC 6962 audit path (RFC 9162 §2.1.3.2, bound to `leaf_index` /
+  `leaf_count`) ↔ `merkle_root` ↔ v3 anchor payload ↔ the digest in the `.ots`
+  receipt header, which must carry at least one attestation. Bitcoin block
+  confirmation is a separate result (`extra.bitcoin_verification`).
+  Other results: `unverifiable` (SKIP: unparsable / attestation-less receipt,
+  or the payload's timestamp did not verify; `extra.reasons`), `not_present`
+  (SKIP, older bundles), `failed` (FAIL).
+- `--bitcoin-rpc` also verifies the **content anchor's** receipt
+  (`anchor/inclusion_anchor_receipt.ots` when the proof is in a later anchor
+  than the chain anchor); a failed node check fails `anchor_inclusion`.
+- `summary.anchor_inclusion` in the JSON report.
+- Public helpers `gpa_verify.core.anchor_leaf_v3` and
+  `gpa_verify.core.merkle_root_from_path`.
+
+### Changed
+
+- Verification now runs 11 layers instead of 10. `anchor_inclusion` is
+  appended last, so the positions of the existing checks in `checks[]` are
+  unchanged. The JSON schema only gains fields. `anchor_witness` details gained
+  an "informational (not independently recomputable): " prefix.
+- Hex digests in `anchor/inclusion.json` must be exactly 64 lowercase hex
+  characters; invalid `proof_id` values (non-string, > 64 chars, NUL, lone
+  surrogates) fail cleanly instead of raising.
+
+### Tests
+
+- `tests/test_anchor_inclusion.py`: RFC 6962 known-answer vectors; path
+  tampering; server-generated v3 fixtures with a (non-qualified) test TSA token
+  (`tests/fixtures/v3/`, same anchor and later anchor) and ten tampered
+  variants; grafted foreign inclusion; garbage and header-only receipts;
+  stripped TSR; crafted proof_id; uppercase hex; `--bitcoin-rpc` on the content
+  receipt (mocked node); real production bundles with an inclusion proof
+  grafted in; the audit's forged-witness PoC; forged TSTInfo; and the
+  independent reviewer's 16 adversarial bundles (`tests/fixtures/review/`).
+- `test_check_count` updated to 11 layers.
+
 ## [1.5.0] — 2026-08-03
 
 ### Security

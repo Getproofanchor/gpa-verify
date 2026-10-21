@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "gpa-verify"
-version = "1.5.0"
+version = "1.6.0"
 description = "Independent verifier for GetProofAnchor evidence bundles"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -68,4 +68,6 @@ include = [
 # stays lean (verification code only).
 exclude = [
     "/tests/fixtures/*.zip",
+    "/tests/fixtures/v3/*.zip",
+    "/tests/fixtures/review/*.zip",
 ]
