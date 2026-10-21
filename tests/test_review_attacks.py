@@ -440,3 +440,45 @@ def test_visible_or_active_timestamp_widget_rejected():
     assert _widget_ok({"FT": "Sig", "Rect": [0, 0, 0, 0], "Subtype": "Widget"})[0]
     assert not _widget_ok({"FT": "Sig", "Rect": [0, 0, 100, 100]})[0]
     assert not _widget_ok({"FT": "Sig", "Rect": [0, 0, 0, 0], "AA": {}})[0]
+
+
+# ─── round 3: parser-differential hardening ─────────────────────────────────
+
+def test_duplicate_dict_key_after_seal_is_rejected(sealed):
+    data, doc = sealed
+    root = dict(doc.root)
+    root["DSS"] = P.Ref(48, 0)
+    body = _ser(root)[:-2] + b"/Pages 4 0 R/Pages 2 0 R>>"   # last-wins here, first-wins elsewhere
+    upd = _update(data, {47: _stream(b"0\x82x"), 48: b"<</Type/DSS/Certs[47 0 R]>>", 3: body})
+    r = _post_seal(verify_sealed_pdf(upd))
+    assert not r.passed and "duplicate dictionary key" in str(r.extra)
+
+
+def test_generation_change_is_rejected(sealed):
+    data, doc = sealed
+    # same content as sealed obj 6, but listed with generation 1
+    o6 = data[doc.xref[6][1]:]
+    o6 = o6[:o6.find(b"endobj") + 6]
+    out = bytearray(data)
+    off = len(out)
+    out += b"\n" + o6.replace(b"6 0 obj", b"6 1 obj", 1) + b"\n"
+    off += 1
+    xo = len(out)
+    prev = int(data[data.rfind(b"startxref") + 9:].split()[0])
+    out += (b"xref\n6 1\n%010d 00001 n \ntrailer\n" % off) + _ser(
+        {"Size": int(doc.trailer["Size"]), "Root": doc.trailer["Root"], "Info": doc.trailer["Info"],
+         "Prev": prev}) + b"\nstartxref\n" + str(xo).encode() + b"\n%%EOF\n"
+    r = _post_seal(verify_sealed_pdf(bytes(out)))
+    assert not r.passed and "generation" in r.detail
+
+
+def test_object_listed_twice_in_one_section_is_rejected(sealed):
+    data, doc = sealed
+    root = dict(doc.root)
+    root["DSS"] = P.Ref(48, 0)
+    upd = _update(data, {47: _stream(b"0\x82x"), 48: b"<</Type/DSS/Certs[47 0 R]>>", 3: _ser(root)})
+    i = upd.rfind(b"\ntrailer\n")
+    line = b"\n47 1\n%010d 00000 n " % doc.xref[5][1]
+    upd = upd[:i] + line + upd[i:]
+    r = _post_seal(verify_sealed_pdf(upd))
+    assert not r.passed and "listed twice" in str(r.extra)

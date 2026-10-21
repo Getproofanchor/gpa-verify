@@ -280,6 +280,10 @@ class Parser:
                     # tolerate garbage: skip
                     continue
                 v = self.parse_object()
+                if str(k) in out and self.resolver is not None:
+                    # viewers differ on which duplicate wins: record it
+                    self.resolver.duplicate_keys.append((self.lex.data is self.resolver.data,
+                                                         self.lex.pos, str(k)))
                 out[str(k)] = v
             return out
         if tok == b"[":
@@ -539,6 +543,7 @@ class XrefSection:
     entries: Dict[int, Tuple[str, int, int]] = field(default_factory=dict)
     # entries: num -> ("n", offset, gen) | ("c", objstm_num, index) | ("f", next, gen)
     end: int = -1                     # offset just after the section's %%EOF line
+    duplicates: List[int] = field(default_factory=list)   # object numbers listed twice
 
 
 @dataclass
@@ -553,6 +558,7 @@ class PDFDocument:
     def __init__(self, data: bytes):
         self.data = data
         self.decoded_bytes = 0
+        self.duplicate_keys: List[Tuple[bool, int, str]] = []   # (in file?, pos, key)
         head = data[:1024]
         hp = head.find(b"%PDF-")
         if hp < 0:
@@ -671,6 +677,7 @@ class PDFDocument:
         d = self.data
         lex = Lexer(d, pos)
         entries: Dict[int, Tuple[str, int, int]] = {}
+        dups: List[int] = []
         while True:
             lex.skip_ws()
             if d[lex.pos:lex.pos + 7] == b"trailer":
@@ -696,12 +703,14 @@ class PDFDocument:
                     lex.pos += 18
                     lex.skip_ws()
                 num = start + i
+                if num in entries:
+                    dups.append(num)
                 entries[num] = ("n" if t == b"n" else "f", o, g)
         parser = Parser(d, lex.pos, resolver=self)
         trailer = parser.parse_object()
         if not isinstance(trailer, dict):
             raise PDFError("trailer is not a dictionary")
-        return XrefSection(off, "table", trailer, entries)
+        return XrefSection(off, "table", trailer, entries, duplicates=dups)
 
     def _read_xref_stream(self, off: int, stm: Stream) -> XrefSection:
         data = decode_stream(stm, None)
@@ -717,6 +726,7 @@ class PDFDocument:
             raise PDFError("xref stream /Index invalid")
         rowlen = sum(w)
         entries: Dict[int, Tuple[str, int, int]] = {}
+        dups: List[int] = []
         pos = 0
 
         def field_val(b: bytes) -> int:
@@ -733,6 +743,8 @@ class PDFDocument:
                 f2 = field_val(row[w[0]:w[0] + w[1]])
                 f3 = field_val(row[w[0] + w[1]:])
                 num = start + i
+                if num in entries:
+                    dups.append(num)
                 if t == 0:
                     entries[num] = ("f", f2, f3)
                 elif t == 1:
@@ -740,7 +752,7 @@ class PDFDocument:
                 elif t == 2:
                     entries[num] = ("c", f2, f3)
         trailer = dict(stm.dict)
-        return XrefSection(off, "stream", trailer, entries)
+        return XrefSection(off, "stream", trailer, entries, duplicates=dups)
 
     def _rebuild_by_scan(self) -> None:
         """Last resort for damaged files: scan for ``N G obj``."""
@@ -807,11 +819,14 @@ class PDFDocument:
                 ooff = lex.next_token()
                 pairs.append((onum, ooff))
             objs: Dict[int, Any] = {}
+            mark = len(self.duplicate_keys)
             for onum, ooff in pairs:
                 try:
                     objs[onum] = Parser(data, first + ooff, resolver=self).parse_object()
                 except PDFError:
                     objs[onum] = None
+            for i in range(mark, len(self.duplicate_keys)):   # tag with the object stream
+                self.duplicate_keys[i] = (False, stm_num, self.duplicate_keys[i][2])
             self._objstm_cache[stm_num] = objs
         return self._objstm_cache[stm_num].get(num)
 

@@ -707,6 +707,11 @@ def _analyze_post_seal(doc: P.PDFDocument, sealed_end: int, sigs: List[_Sig]) ->
             if len(disallowed) > 50:
                 break
 
+    for sec in later:
+        if sec.duplicates:
+            disallowed.append({"object": sec.duplicates[0], "revision_xref": sec.offset,
+                               "classified": "object number listed twice in one xref section"})
+
     dss_struct, dss_streams, dss_problems = _collect_dss(doc, doc.root.get("DSS"))
     later_sig_nums = {s.num for s in sigs if s.end > sealed_end and s.num is not None}
     xref_stream_offsets = {s.offset for s in later if s.kind == "stream"}
@@ -745,6 +750,9 @@ def _analyze_post_seal(doc: P.PDFDocument, sealed_end: int, sigs: List[_Sig]) ->
         if cur is None:
             disallowed.append({"object": num, "classified": "deleted after sealing"})
             continue
+        if cur_e and old_e and cur_e[0] == "n" and old_e[0] == "n" and cur_e[2] != old_e[2]:
+            disallowed.append({"object": num, "classified": "generation number changed"})
+            continue
         if old is not None and _same(old, cur):
             continue
         ok, why = _classify_change(ctx, num, cur, old)
@@ -752,6 +760,13 @@ def _analyze_post_seal(doc: P.PDFDocument, sealed_end: int, sigs: List[_Sig]) ->
         changes.append(rec)
         if not ok:
             disallowed.append(rec)
+
+    # duplicate dictionary keys in post-seal objects: viewers disagree on
+    # which value wins, so the comparison above cannot be trusted for them
+    for in_file, where, key in doc.duplicate_keys:
+        if (in_file and where >= sealed_end) or (not in_file and where not in sealed.xref):
+            disallowed.append({"object": None, "classified": f"duplicate dictionary key /{key} after sealing"})
+            break
 
     extra = {"revisions_after": len(later), "changed_objects": changes[:50]}
     if dss_problems and dss_struct:
