@@ -2057,6 +2057,11 @@ def verify_evidence_zip(
         ))
         return report
 
+    # Forensic Browser (desktop app) packages have their own layout.
+    from .forensic_browser import is_fb_manifest, verify_fb_zip
+    if is_fb_manifest(manifest, _read_zip_json(zf, "proof.json")):
+        return verify_fb_zip(zip_bytes)
+
     report.proof_id = manifest.get("proof_id")
     report.bundle_format = manifest.get("format")
     report.generated_at = manifest.get("generated_at")

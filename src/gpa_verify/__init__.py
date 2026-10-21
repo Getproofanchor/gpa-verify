@@ -14,10 +14,17 @@ from .core import (
     VerifyReport,
     verify_evidence_zip,
 )
+from .dispatch import detect_kind, verify_bytes
+from .forensic_browser import verify_fb_zip, verify_plain_copy, verify_sealed_pdf
 
 __all__ = [
     "CheckResult",
     "VerifyReport",
-    "verify_evidence_zip",
     "__version__",
+    "detect_kind",
+    "verify_bytes",
+    "verify_evidence_zip",
+    "verify_fb_zip",
+    "verify_plain_copy",
+    "verify_sealed_pdf",
 ]
