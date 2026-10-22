@@ -48,7 +48,7 @@ def test_pristine_bundle_verifies(fixture_zip: bytes):
     """A pristine bundle should pass every check."""
     report = verify_evidence_zip(fixture_zip)
     assert not report.any_failed, (
-        f"unexpected failure(s):\n"
+        "unexpected failure(s):\n"
         + "\n".join(
             f"  {c.name}: {c.detail}"
             for c in report.checks
@@ -293,7 +293,7 @@ def test_invalid_zip_rejected():
 def test_empty_zip_rejected():
     """Empty ZIP should be rejected."""
     out = io.BytesIO()
-    with zipfile.ZipFile(out, "w") as zf:
+    with zipfile.ZipFile(out, "w"):
         pass
     report = verify_evidence_zip(out.getvalue())
     assert report.any_failed
