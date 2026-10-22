@@ -1,5 +1,38 @@
 # Changelog
 
+## [1.7.0] — 2026-10-22
+
+### Added
+
+- **Forensic Browser "Files and documents" evidence**
+  (`getproofanchor-files-1`, app ≥ 1.5.0) in ZIP and sealed-PDF form, and
+  its plain copy. New ZIP check `files`: every file `files/NN/<name>`
+  declared in `proof.json` must match its SHA-256, SHA-512 and size, be bound
+  to the time-stamped payload and be described by a sealed
+  `files/NN/source.json` that agrees with `proof.json`; `file_count`,
+  `total_size` and `capture_meta` must agree; names must be single safe path
+  components with unique indices; nothing undeclared may live under
+  `files/`. For the sealed PDF, `evidence_consistency` performs the same
+  comparison against the attachments. For the plain copy, printed URLs are
+  matched against the request, redirect, final and download URLs recorded in
+  the original.
+- Tests built from real outputs of the app's builder
+  (`tests/fixtures/forensic_browser/files/`, regenerated with
+  `make_fixtures.py` there), including tamper cases and dispatch tests.
+
+### Changed
+
+- `is_fb_manifest` / dispatch: a manifest with format
+  `getproofanchor-evidence-N` (SaaS bundle, including file-digest proofs) is
+  never routed to the Forensic Browser verifier, even if `proof.json` names a
+  Forensic Browser version; a `getproofanchor-files-N` manifest always is.
+  Web-format (`getproofanchor-lite-2`) verification is unchanged.
+
+### Fixed
+
+- Two ruff findings in `tests/test_verify.py`.
+
+
 ## [1.6.0] — 2026-10-21
 
 ### Security

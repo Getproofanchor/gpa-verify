@@ -167,11 +167,71 @@ It identifies the sealed original in two places:
 its TSTInfo serial. The copy's screenshot preview is a reduced JPEG; the
 screenshot SHA-256 it prints refers to the original PNG in the sealed PDF.
 
+## 3a. "Files and documents" — `format = "getproofanchor-files-1"` (app ≥ 1.5.0)
+
+Documented from the producer's source (shared/files_evidence.py) for 1.7.0.
+The operator seals one or more files (from the computer, downloaded from a
+URL in the browser session, or from the browser's Downloads panel) into one
+evidence with one time-stamp, in any of the three containers above (ZIP,
+sealed PDF, sealed PDF + plain copy). The time-stamp, `manifest.json`,
+`timestamp/`, PAdES and plain-copy rules are exactly those of the web format;
+only the content differs:
+
+```
+files/NN/<name>              sealed   the file, byte for byte as read (NN = 01, 02, …)
+files/NN/source.json         sealed   format getproofanchor-file-source-1: index, name, size,
+                                      sha256, sha512, mime {detected (magic bytes), extension,
+                                      extension_matches}, source {type local|url|download, …},
+                                      file_system (local only, operator-supplied times), metadata
+                                      (EXIF / PDF Info + signature fields / OOXML docProps), steps,
+                                      operator_note
+capture/capture_meta.json    sealed   kind "files", file_count, tool/host, options, limits
+capture/capture_meta.sha256  sealed
+proof.json                   sealed   see below
+```
+
+`proof.json` (and `eidas_payload.json`) carry `format: "getproofanchor-files-1"`
+and `kind: "files"`; the payload lists every file above. `proof.json`:
+
+```json
+{"format": "getproofanchor-files-1", "kind": "files", "session_id": "sess-…",
+ "operator": {"username", "name", "holder", "licence_ref", "device_ref"},
+ "started_at", "finished_at", "app_version": "gpa-forensic-browser-…",
+ "file_count": 4, "total_size": 120588, "description": "…optional…",
+ "capture_meta_sha256": "…",
+ "files": [{"index": 1, "name": "x.pdf", "path": "files/01/x.pdf", "size": 1652,
+            "sha256": "…", "sha512": "…", "mime": "application/pdf",
+            "source": {"type": "url", "url": "…", "final_url": "…", "http_status": 200,
+                       "redirects": [{"url", "status", "location"}]},
+            "source_json_sha256": "…", "note": "…optional…"}]}
+```
+
+URL sources record every redirect hop (status, `Location`, whitelisted
+headers), the final response's whitelisted headers (`server_headers`:
+content-type, content-length, content-disposition, last-modified, etag,
+date, server, content-encoding — never cookies or credentials), request
+times, a separate DNS lookup and the TLS certificate the app had verified for
+the host. Field names follow the SaaS file-digest bundle where they overlap
+(`final_url`, `http_status`, `redirect_chain`, `server_headers`, `sha512`).
+Download sources record the browser's URL chain, reported MIME type, ETag,
+Last-Modified and the SHA-256 at download completion
+(`unchanged_since_completion`).
+
+In the sealed PDF every file is an attachment named `files_NN_<name>`
+(`/Desc` carries the original path; executable types get a `.txt` suffix for
+Adobe Reader) with its `/Subtype` taken from the detected MIME type.
+
+A Forensic Browser files package is **not** a SaaS file-digest bundle
+(`getproofanchor-evidence-N` with `files_manifest.json`); `detect_kind`
+routes on `manifest.format`, so neither can be verified as the other.
+
 ## 4. What gpa-verify checks per format
 
 | Format | Checks |
 |---|---|
 | ZIP | `fb_package` (format, session ids agree) · `bundle_integrity` (SHA-256 + size of every file vs manifest, no undeclared files, counts, `payload_sha256`) · `sealed_binding` (every payload hash = file, payload set = manifest sealed set, payload metadata = proof.json, sidecars) · `pages` (per page dir: screenshot/html/mhtml hashes = proof.json and sealed; no stray page dirs) · `timestamp_token` · `tsa_chain` · `tsa_trust_root` (pinned SK roots) · `tsl_qualified` (bundled TSL, status at genTime) · `timestamp_metadata` (eidas_meta / verification report / qualified_context agree with token and TSL file) · `report_pdf` (report cites session, payload hash, serial) |
+| Files ZIP | as ZIP, with `files` instead of `pages`: per file SHA-256 + SHA-512 + size = proof.json, file and its `source.json` bound to the payload, `source.json` agrees with proof.json (index, name, hashes, size, source type), `source_json_sha256`, `file_count`, `total_size`, `capture_meta.kind/file_count`, safe names, unique indices, nothing undeclared under `files/` |
+| Files PDF | as sealed PDF; `evidence_consistency` checks proof.json ↔ `files/NN/*` attachments (SHA-256, SHA-512, size, `source.json`), no undeclared `files/` attachment, printed SHA-256 values ↔ attachments. Plain copy: URLs printed on the copy must be request/redirect/final/download URLs recorded in the original (a URL wrapped over two lines may appear as its first line) |
 | Sealed PDF | `pdf_structure` · `pades_signature` (ByteRange starts at 0, gap is exactly this dict's `/Contents` hex string, ends at a revision boundary, padding is zeros, field in AcroForm) · `timestamp_token` (imprint = hash of ByteRange data) · `tsa_chain` · `tsa_trust_root` · `tsl_qualified` (needs `--tsl`) · `post_seal_changes` (later revisions only DSS/VRI/doc-time-stamps, otherwise "MODIFIED AFTER SEALING" with object list and the sealed revision's length + SHA-256) · `attachments` (all embedded files, SHA-256, inside sealed range, vs embedded manifest) · `evidence_consistency` (proof.json ↔ attachments, printed hashes ↔ attachments) |
 | Plain copy | `copy_identification` (QR via built-in pure-Python QR reader + printed text, must agree) · `copy_integrity` = SKIP → verdict `NOT_VERIFIABLE` (exit 3). With `--original`: all sealed-PDF checks as `original.*` + `copy_binding` (SHA-256, size, session, serial, time) + `copy_content_consistency` (hashes/URLs printed on the copy exist in the original) |
 

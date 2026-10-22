@@ -35,6 +35,10 @@ from . import pdfmini as P
 from .tsp_verify import pem_to_der_list, token_checks, verify_token
 
 FB_FORMATS = frozenset({"getproofanchor-lite-2"})
+# Forensic Browser "Files and documents" evidence (since app 1.5.0): one or
+# more files sealed with one time-stamp. Same container, timestamp, manifest
+# and PAdES rules as the web format; different content (files/NN/…).
+FILES_FORMATS = frozenset({"getproofanchor-files-1"})
 PLAIN_COPY_TYPE = "getproofanchor-plain-copy"
 
 VERDICT_VERIFIED = "VERIFIED"
@@ -165,6 +169,14 @@ def is_fb_manifest(manifest: Optional[Dict[str, Any]], proof: Optional[Dict[str,
     fmt = (manifest or {}).get("format") or ""
     if isinstance(fmt, str) and fmt.startswith("getproofanchor-lite-"):
         return True
+    if fmt in FILES_FORMATS:
+        return True
+    # SaaS bundles ("getproofanchor-evidence-N", incl. file-digest proofs with
+    # files_manifest.json) are never Forensic Browser outputs, whatever
+    # proof.json claims — an FB "files" package and a SaaS file-digest bundle
+    # must not be routed to each other's verifier.
+    if isinstance(fmt, str) and fmt.startswith("getproofanchor-evidence-"):
+        return False
     app = (proof or {}).get("app_version") or ""
     return isinstance(app, str) and app.startswith("gpa-forensic-browser")
 
@@ -220,8 +232,14 @@ def verify_fb_zip(zip_bytes: bytes) -> VerifyReport:
     if tsr is None:
         probs.append("timestamp/eidas.tsr missing")
     fmt = (manifest or {}).get("format")
-    if manifest is not None and fmt not in FB_FORMATS:
-        probs.append(f"unsupported Forensic Browser format {fmt!r} (supported: {sorted(FB_FORMATS)})")
+    is_files = fmt in FILES_FORMATS
+    if manifest is not None and fmt not in FB_FORMATS and not is_files:
+        probs.append(f"unsupported Forensic Browser format {fmt!r} "
+                     f"(supported: {sorted(FB_FORMATS | FILES_FORMATS)})")
+    if is_files:
+        for name, obj in (("proof.json", proof), ("eidas_payload.json", payload)):
+            if obj is not None and (obj.get("format") != fmt or obj.get("kind") != "files"):
+                probs.append(f"{name} format/kind is not {fmt}/files")
     sids = {
         "manifest.json": (manifest or {}).get("session_id"),
         "proof.json": (proof or {}).get("session_id"),
@@ -346,8 +364,11 @@ def verify_fb_zip(zip_bytes: bytes) -> VerifyReport:
                **({"failures": fails[:20]} if fails else {})},
     ))
 
-    # ── pages: per-page artefacts (multi-page sessions) ───────────────────
-    report.checks.append(_check_pages(proof, capture_meta, read, names, pfiles))
+    # ── pages / files: per-item artefacts ─────────────────────────────────
+    if is_files:
+        report.checks.append(_check_files(proof, capture_meta, read, names, pfiles, files_meta))
+    else:
+        report.checks.append(_check_pages(proof, capture_meta, read, names, pfiles))
 
     # ── timestamp_token / tsa_chain / tsl_qualified ───────────────────────
     pool: List[bytes] = []
@@ -439,6 +460,138 @@ def _check_pages(proof, capture_meta, read, names, pfiles) -> CheckResult:
                 "and sealed" if not fails else f"{len(fails)} page problem(s)"),
         extra={"pages": [{"index": p.get("index"), "url": p.get("url"), "captured_at": p.get("captured_at")}
                          for p in pages if isinstance(p, dict)],
+               **({"failures": fails[:20]} if fails else {})},
+    )
+
+
+_SAFE_NAME_BAD = re.compile(r'[\x00-\x1f\x7f/\\<>:"|?*]')
+
+
+def _files_entry_problems(e: Any, seen_idx: set) -> Tuple[Optional[int], Optional[str], List[str]]:
+    """Shape of one proof.files[] entry: (index, path, problems)."""
+    probs: List[str] = []
+    if not isinstance(e, dict):
+        return None, None, ["file entry is not an object"]
+    idx, name = e.get("index"), e.get("name")
+    if not isinstance(idx, int) or isinstance(idx, bool) or not 1 <= idx <= 9999:
+        return None, None, [f"file entry without a valid index: {idx!r}"]
+    if idx in seen_idx:
+        probs.append(f"duplicate file index {idx}")
+    seen_idx.add(idx)
+    if (not isinstance(name, str) or not name or name in (".", "..") or _SAFE_NAME_BAD.search(name)
+            or name.lower().startswith("source.json")):
+        return idx, None, probs + [f"file {idx}: unsafe or missing name {name!r}"]
+    path = f"files/{idx:02d}/{name}"
+    if e.get("path") is not None and e.get("path") != path:
+        probs.append(f"file {idx}: path {e.get('path')!r} != {path!r}")
+    for k, n in (("sha256", 64), ("sha512", 128)):
+        v = e.get(k)
+        if not isinstance(v, str) or not re.fullmatch(f"[0-9a-f]{{{n}}}", v):
+            probs.append(f"file {idx}: {k} missing or malformed")
+    if not isinstance(e.get("size"), int):
+        probs.append(f"file {idx}: size missing")
+    return idx, path, probs
+
+
+def _check_files(proof, capture_meta, read, names, pfiles, files_meta) -> CheckResult:
+    """'Files and documents' package: proof.json ↔ files/NN/* ↔ payload.
+
+    Every declared file must exist under files/NN/<name>, match its SHA-256,
+    SHA-512 and size, be bound to the time-stamped payload and be described by
+    a sealed files/NN/source.json that agrees with proof.json. Nothing else
+    may live under files/.
+    """
+    if not proof:
+        return CheckResult("files", False, detail="proof.json missing")
+    entries = proof.get("files")
+    if not isinstance(entries, list) or not entries:
+        return CheckResult("files", False, detail="proof.json lists no files")
+    fails: List[Dict[str, Any]] = []
+    fc = proof.get("file_count")
+    if fc != len(entries):
+        fails.append({"error": f"file_count={fc!r} but {len(entries)} files listed"})
+    if capture_meta is not None and capture_meta.get("file_count") != len(entries):
+        fails.append({"error": "capture_meta.file_count disagrees with proof.json"})
+    if capture_meta is not None and capture_meta.get("kind") != "files":
+        fails.append({"error": "capture_meta.kind is not 'files'"})
+    cm_raw = read("capture/capture_meta.json")
+    if cm_raw is None:
+        fails.append({"error": "capture/capture_meta.json missing"})
+    elif proof.get("capture_meta_sha256") != _sha256(cm_raw):
+        fails.append({"error": "proof.capture_meta_sha256 != SHA-256(capture/capture_meta.json)"})
+    elif "capture/capture_meta.json" not in pfiles:
+        fails.append({"error": "capture/capture_meta.json not in time-stamped payload"})
+    if "proof.json" not in pfiles:
+        fails.append({"error": "proof.json not in time-stamped payload"})
+    total = 0
+    declared = set()
+    seen_idx: set = set()
+    checked = 0
+    for e in entries:
+        idx, path, probs = _files_entry_problems(e, seen_idx)
+        fails.extend({"file": idx, "error": p} for p in probs)
+        if path is None:
+            continue
+        side = f"files/{idx:02d}/source.json"
+        declared.update((path, side))
+        data = read(path)
+        if data is None:
+            fails.append({"file": idx, "path": path, "error": "declared in proof.json but missing"})
+            continue
+        total += len(data)
+        bad = False
+        if _sha256(data) != e.get("sha256"):
+            fails.append({"file": idx, "path": path, "error": "SHA-256 differs from proof.json",
+                          "expected": e.get("sha256"), "actual": _sha256(data)})
+            bad = True
+        if hashlib.sha512(data).hexdigest() != e.get("sha512"):
+            fails.append({"file": idx, "path": path, "error": "SHA-512 differs from proof.json"})
+            bad = True
+        if e.get("size") != len(data):
+            fails.append({"file": idx, "path": path, "error": "size differs from proof.json"})
+            bad = True
+        if pfiles.get(path) != _sha256(data):
+            fails.append({"file": idx, "path": path, "error": "file not bound to the time-stamped payload"})
+            bad = True
+        sraw = read(side)
+        src = _json(sraw)
+        if sraw is None or src is None:
+            fails.append({"file": idx, "path": side, "error": "source.json missing or invalid"})
+            bad = True
+        else:
+            if pfiles.get(side) != _sha256(sraw):
+                fails.append({"file": idx, "path": side, "error": "source.json not bound to the time-stamped payload"})
+                bad = True
+            if e.get("source_json_sha256") is not None and e.get("source_json_sha256") != _sha256(sraw):
+                fails.append({"file": idx, "path": side, "error": "proof.source_json_sha256 != SHA-256(source.json)"})
+                bad = True
+            for k in ("index", "name", "sha256", "sha512", "size"):
+                if src.get(k) != e.get(k):
+                    fails.append({"file": idx, "path": side, "error": f"source.json {k} disagrees with proof.json"})
+                    bad = True
+            st = (src.get("source") or {}).get("type")
+            pt = (e.get("source") or {}).get("type")
+            if st != pt or st not in ("local", "url", "download"):
+                fails.append({"file": idx, "path": side, "error": f"source type {st!r} / {pt!r} invalid or inconsistent"})
+                bad = True
+        if not bad:
+            checked += 1
+    if isinstance(proof.get("total_size"), int) and proof["total_size"] != total:
+        fails.append({"error": "proof.total_size disagrees with the files"})
+    for n in names:
+        if n.startswith("files/") and n not in declared:
+            fails.append({"path": n, "error": "file under files/ not declared in proof.json"})
+    for n in pfiles:
+        if n.startswith("files/") and n not in declared:
+            fails.append({"path": n, "error": "sealed payload lists a files/ entry not declared in proof.json"})
+    return CheckResult(
+        "files", not fails,
+        detail=(f"{len(entries)} file(s): SHA-256, SHA-512, size and source.json consistent with "
+                f"proof.json and sealed ({checked} checked)" if not fails
+                else f"{len(fails)} file problem(s)"),
+        extra={"files": [{"index": e.get("index"), "name": e.get("name"), "size": e.get("size"),
+                          "sha256": e.get("sha256"), "source": (e.get("source") or {}).get("type")}
+                         for e in entries if isinstance(e, dict)],
                **({"failures": fails[:20]} if fails else {})},
     )
 
@@ -1330,6 +1483,8 @@ def _check_pdf_evidence(proof, manifest, atts, text, sid) -> CheckResult:
     by_path = {a.get("manifest_path"): a for a in atts if a.get("manifest_path")}
     if proof is None:
         return CheckResult("evidence_consistency", False, detail="proof.json not attached")
+    if (manifest or {}).get("format") in FILES_FORMATS or proof.get("format") in FILES_FORMATS:
+        return _check_files_pdf(proof, manifest, atts, by_path, text, sid)
     if manifest and manifest.get("session_id") and manifest.get("session_id") != proof.get("session_id"):
         fails.append({"error": "manifest.session_id != proof.session_id"})
     cm = by_path.get("capture/capture_meta.json")
@@ -1386,6 +1541,127 @@ def _check_pdf_evidence(proof, manifest, atts, text, sid) -> CheckResult:
                          for p in pages if isinstance(p, dict)],
                **({"failures": fails[:20]} if fails else {})},
     )
+
+
+def _check_files_pdf(proof, manifest, atts, by_path, text, sid) -> CheckResult:
+    """'Files and documents' evidence as a sealed PDF: the preserved files are
+    attachments; proof.json ↔ attachments ↔ embedded manifest.json."""
+    fails: List[Dict[str, Any]] = []
+    fmt = (manifest or {}).get("format")
+    if fmt not in FILES_FORMATS or proof.get("format") != fmt or proof.get("kind") != "files":
+        fails.append({"error": f"manifest/proof format mismatch ({fmt!r} / {proof.get('format')!r})"})
+    if manifest and manifest.get("session_id") != proof.get("session_id"):
+        fails.append({"error": "manifest.session_id != proof.session_id"})
+    cm = by_path.get("capture/capture_meta.json")
+    if cm is None:
+        fails.append({"error": "capture/capture_meta.json not attached"})
+    else:
+        if proof.get("capture_meta_sha256") != cm["sha256"]:
+            fails.append({"error": "proof.capture_meta_sha256 != attached capture_meta.json"})
+        cmj = _json(cm["_data"]) or {}
+        if cmj.get("session_id") != proof.get("session_id"):
+            fails.append({"error": "capture_meta.session_id != proof.session_id"})
+        if cmj.get("kind") != "files":
+            fails.append({"error": "capture_meta.kind is not 'files'"})
+    entries = proof.get("files")
+    if not isinstance(entries, list) or not entries:
+        entries = []
+        fails.append({"error": "proof.json lists no files"})
+    if proof.get("file_count") != len(entries):
+        fails.append({"error": f"file_count={proof.get('file_count')!r} but {len(entries)} files listed"})
+    declared = set()
+    seen_idx: set = set()
+    checked = 0
+    for e in entries:
+        idx, path, probs = _files_entry_problems(e, seen_idx)
+        fails.extend({"file": idx, "error": p} for p in probs)
+        if path is None:
+            continue
+        side = f"files/{idx:02d}/source.json"
+        declared.update((path, side))
+        a = by_path.get(path)
+        if a is None:
+            fails.append({"file": idx, "path": path, "error": "declared in proof.json but not attached"})
+            continue
+        data = a.get("_data") or b""
+        bad = False
+        if a.get("sha256") != e.get("sha256"):
+            fails.append({"file": idx, "path": path, "error": "SHA-256 differs from proof.json"})
+            bad = True
+        if hashlib.sha512(data).hexdigest() != e.get("sha512") or len(data) != e.get("size"):
+            fails.append({"file": idx, "path": path, "error": "SHA-512 or size differs from proof.json"})
+            bad = True
+        sa = by_path.get(side)
+        src = _json(sa["_data"]) if sa else None
+        if src is None:
+            fails.append({"file": idx, "path": side, "error": "source.json not attached or invalid"})
+            bad = True
+        else:
+            if e.get("source_json_sha256") is not None and e["source_json_sha256"] != sa["sha256"]:
+                fails.append({"file": idx, "path": side, "error": "proof.source_json_sha256 != attached source.json"})
+                bad = True
+            for k in ("index", "name", "sha256", "sha512", "size"):
+                if src.get(k) != e.get(k):
+                    fails.append({"file": idx, "path": side, "error": f"source.json {k} disagrees with proof.json"})
+                    bad = True
+        if not bad:
+            checked += 1
+    for p in by_path:
+        if isinstance(p, str) and p.startswith("files/") and p not in declared:
+            fails.append({"path": p, "error": "attachment under files/ not declared in proof.json"})
+    if sid and sid not in text:
+        fails.append({"error": "session id not shown in the document text"})
+    cited = set(re.findall(r"\b[0-9a-f]{64}\b", text))
+    known = {a["sha256"] for a in atts if a.get("sha256")}
+    unknown = sorted(cited - known)
+    if unknown:
+        fails.append({"error": "document text cites SHA-256 values that match no attachment",
+                      "values": unknown[:10]})
+    return CheckResult(
+        "evidence_consistency", not fails,
+        detail=(f"proof.json ↔ attachments consistent ({len(entries)} file(s), {checked} with matching "
+                f"SHA-256/SHA-512/size/source.json); {len(cited)} SHA-256 value(s) printed in the "
+                "document match attachments" if not fails else f"{len(fails)} inconsistency(ies)"),
+        extra={"session_id": proof.get("session_id"), "app_version": proof.get("app_version"),
+               "kind": "files",
+               "files": [{"index": e.get("index"), "name": e.get("name"), "size": e.get("size"),
+                          "sha256": e.get("sha256")} for e in entries if isinstance(e, dict)],
+               **({"failures": fails[:20]} if fails else {})},
+    )
+
+
+def _files_known_urls(oproof: Optional[Dict[str, Any]], atts_by_name: Dict[str, Dict[str, Any]]) -> set:
+    """Every URL recorded for a 'files' evidence (proof.json + source.json)."""
+    urls: set = set()
+
+    def add(u: Any) -> None:
+        if isinstance(u, str) and u:
+            urls.add(u)
+    for e in (oproof or {}).get("files") or []:
+        if not isinstance(e, dict):
+            continue
+        s = e.get("source") or {}
+        add(s.get("url"))
+        add(s.get("final_url"))
+        for u in s.get("url_chain") or []:
+            add(u)
+        for r in s.get("redirects") or []:
+            if isinstance(r, dict):
+                add(r.get("url"))
+                add(r.get("location"))
+        idx = e.get("index")
+        if isinstance(idx, int):
+            src = _json((atts_by_name.get(f"files_{idx:02d}_source.json") or {}).get("_data"))
+            ss = (src or {}).get("source") or {}
+            for k in ("url", "final_url"):
+                add(ss.get(k))
+            for u in (ss.get("url_chain") or []) + (ss.get("redirect_chain") or []):
+                add(u)
+            for r in ss.get("redirects") or []:
+                if isinstance(r, dict):
+                    add(r.get("url"))
+                    add(r.get("location"))
+    return urls
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1568,8 +1844,10 @@ def verify_plain_copy(copy_bytes: bytes, *, original: Optional[bytes] = None,
     oatts = orig.summary.get("attachments") or []
     known = {a.get("sha256") for a in oatts if a.get("sha256")}
     oproof = None
+    oatts_by_name: Dict[str, Dict[str, Any]] = {}
     try:
         for a in list_attachments(P.PDFDocument(original)):
+            oatts_by_name[a.get("name") or ""] = a
             if a.get("name") == "proof.json":
                 oproof = _json(a["_data"])
     except Exception:
@@ -1578,12 +1856,21 @@ def verify_plain_copy(copy_bytes: bytes, *, original: Optional[bytes] = None,
         for k in ("screenshot_sha256", "page_html_sha256", "mhtml_sha256"):
             if pg.get(k):
                 known.add(pg[k])
+    files_kind = (oproof or {}).get("format") in FILES_FORMATS
     ctext = ident.get("full_text") or ""
     cited = set(re.findall(r"\b[0-9a-f]{64}\b", ctext)) - {idd.get("sha256")}
     unknown = sorted(cited - known)
     urls_copy = set(re.findall(r"https?://\S+", ctext))
-    urls_orig = {p.get("url") for p in (oproof or {}).get("pages") or []}
-    url_unknown = sorted(u for u in urls_copy if u not in urls_orig)
+    if files_kind:
+        # Files evidence prints request, redirect and final URLs. A long URL
+        # is wrapped in the record, so the extracted text may hold only its
+        # first line: accept a printed URL that is a prefix of a sealed one.
+        urls_orig = _files_known_urls(oproof, oatts_by_name)
+        url_unknown = sorted(u for u in urls_copy
+                             if u not in urls_orig and not any(k.startswith(u) for k in urls_orig))
+    else:
+        urls_orig = {p.get("url") for p in (oproof or {}).get("pages") or []}
+        url_unknown = sorted(u for u in urls_copy if u not in urls_orig)
     cprobs = []
     if unknown:
         cprobs.append(f"{len(unknown)} SHA-256 value(s) printed on the copy are not in the sealed original")
