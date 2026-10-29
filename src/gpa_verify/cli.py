@@ -7,6 +7,7 @@ Usage:
     gpa-verify --quiet path/to/evidence.zip ; echo $?
     gpa-verify sealed.pdf [--tsl EE.xml|dir|package.zip]
     gpa-verify plain-copy_bez-pecete.pdf --original sealed.pdf
+    gpa-verify sealed.pdf --media sealed_media.zip   (FB video & audio, 1.7.2)
 
 Input kind is auto-detected: SaaS evidence ZIP, Forensic Browser ZIP,
 PAdES-sealed PDF, or unsealed plain copy / report PDF.
@@ -217,6 +218,17 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--media",
+        type=Path,
+        metavar="ZIP",
+        default=None,
+        help=(
+            "for a sealed Forensic Browser PDF whose video/audio was too large to "
+            "embed: the companion archive (…_media.zip) delivered with it; every "
+            "media file is checked against the SHA-256 sealed in the PDF"
+        ),
+    )
+    parser.add_argument(
         "--tsl",
         action="append",
         metavar="PATH",
@@ -289,7 +301,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     original = None
-    for p in [args.original] if args.original else []:
+    for p in ([args.original] if args.original else []) + ([args.media] if args.media else []):
         if not p.is_file():
             print(f"error: file not found: {p}", file=sys.stderr)
             return 2
@@ -308,6 +320,7 @@ def main(argv: list[str] | None = None) -> int:
             cert_paths=[str(p) for p in args.certs],
             trust_root_paths=[str(p) for p in args.trust_root],
             bitcoin_rpc=args.bitcoin_rpc,
+            media=args.media.read_bytes() if args.media else None,
         )
     except OSError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -317,6 +330,8 @@ def main(argv: list[str] | None = None) -> int:
     integrity_only = verdict == "INTEGRITY_ONLY"
     if args.original and _kind not in ("plain_copy", "fb_report", "saas_report"):
         print(f"warning: --original is ignored for this input ({_kind})", file=sys.stderr)
+    if args.media and _kind != "sealed_pdf":
+        print(f"warning: --media is ignored for this input ({_kind})", file=sys.stderr)
     if args.bitcoin_rpc and _kind not in ("saas_zip", "zip_unknown"):
         print(f"warning: --bitcoin-rpc is ignored for this input ({_kind})", file=sys.stderr)
 

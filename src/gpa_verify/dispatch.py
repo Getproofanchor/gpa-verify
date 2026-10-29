@@ -75,11 +75,15 @@ def verify_bytes(
     cert_paths: Optional[List[str]] = None,
     bitcoin_rpc: Optional[str] = None,
     trust_root_paths: Optional[List[str]] = None,
+    media: Optional[bytes] = None,
 ) -> Tuple[str, VerifyReport]:
     """Verify any supported GetProofAnchor output. Returns (kind, report).
 
     ``trust_root_paths``: extra root certificates (PEM/DER) the TSA chain may
-    end in, in addition to the roots pinned in gpa_verify.trust."""
+    end in, in addition to the roots pinned in gpa_verify.trust.
+
+    ``media`` (1.7.2): the companion ZIP of a sealed Forensic Browser PDF whose
+    video/audio was too large to embed; checked against the sealed SHA-256."""
     from . import forensic_browser as FB
     from .trust import extra_roots, load_root_files
 
@@ -88,7 +92,7 @@ def verify_bytes(
     roots = load_root_files(trust_root_paths or [])
     try:
         with extra_roots(roots):
-            rep = _route(kind, data, original, original_name, tsl, certs, bitcoin_rpc)
+            rep = _route(kind, data, original, original_name, tsl, certs, bitcoin_rpc, media)
         if not rep.summary:  # core returns an empty summary when the ZIP is unusable
             rep.summary = {"checks_total": len(rep.checks),
                            "checks_passed": sum(1 for c in rep.checks if c.passed),
@@ -105,7 +109,7 @@ def verify_bytes(
         return kind, rep
 
 
-def _route(kind, data, original, original_name, tsl, certs, bitcoin_rpc) -> VerifyReport:
+def _route(kind, data, original, original_name, tsl, certs, bitcoin_rpc, media=None) -> VerifyReport:
     from . import forensic_browser as FB
     from .core import verify_evidence_zip
 
@@ -114,7 +118,7 @@ def _route(kind, data, original, original_name, tsl, certs, bitcoin_rpc) -> Veri
     if kind == "fb_zip":
         return FB.verify_fb_zip(data)
     if kind == "sealed_pdf":
-        return FB.verify_sealed_pdf(data, tsl_files=tsl, extra_certs=certs)
+        return FB.verify_sealed_pdf(data, tsl_files=tsl, extra_certs=certs, media_zip=media)
     if kind == "plain_copy":
         return FB.verify_plain_copy(data, original=original, original_name=original_name,
                                     tsl_files=tsl, extra_certs=certs)

@@ -1227,6 +1227,88 @@ def _name_text(x: Any) -> Optional[str]:
     return None
 
 
+_HEX64 = re.compile(r"[0-9a-f]{64}")
+
+
+def _external_files(manifest: Optional[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """manifest.external_files (FB 1.6.0+): media not embedded in the PDF.
+
+    Only well-formed entries (relative path under media/, SHA-256, size)."""
+    ext = (manifest or {}).get("external_files")
+    out: Dict[str, Dict[str, Any]] = {}
+    if not isinstance(ext, dict):
+        return out
+    for path, meta in ext.items():
+        if (isinstance(path, str) and path.startswith("media/") and ".." not in path.split("/")
+                and isinstance(meta, dict) and isinstance(meta.get("sha256"), str)
+                and _HEX64.fullmatch(meta["sha256"]) and isinstance(meta.get("size"), int)):
+            out[path] = meta
+    return out
+
+
+def _media_proof_files(proof: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out = []
+    for m in (proof or {}).get("media") or []:
+        if not isinstance(m, dict):
+            continue
+        for f in m.get("files") or []:
+            if isinstance(f, dict) and isinstance(f.get("sha256"), str) and _HEX64.fullmatch(f["sha256"]):
+                out.append(f)
+    return out
+
+
+def _check_external_media(external: Dict[str, Dict[str, Any]], media_zip: Optional[bytes]) -> CheckResult:
+    listing = {p: {"sha256": m["sha256"], "size": m["size"], "container": m.get("container")}
+               for p, m in sorted(external.items())}
+    if media_zip is None:
+        return CheckResult(
+            "external_media", False, skipped=True,
+            detail=(f"{len(external)} media file(s) are not embedded; their SHA-256 values are "
+                    "sealed in this document — pass the companion archive with --media to verify them"),
+            extra={"external_files": listing})
+    from .core import MAX_ZIP_ENTRY, zip_structure_problems
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(media_zip))
+    except zipfile.BadZipFile as exc:
+        return CheckResult("external_media", False, detail=f"companion archive is not a valid ZIP: {exc}",
+                           extra={"external_files": listing})
+    probs = zip_structure_problems(zf)
+    if probs:
+        return CheckResult("external_media", False, detail="companion archive: " + "; ".join(probs[:3]),
+                           extra={"external_files": listing})
+    fails: List[Dict[str, Any]] = []
+    ok = 0
+    names = set(zf.namelist())
+    for path, meta in sorted(external.items()):
+        if path not in names:
+            fails.append({"file": path, "error": "missing from the companion archive"})
+            continue
+        info = zf.getinfo(path)
+        if info.file_size > MAX_ZIP_ENTRY:
+            fails.append({"file": path, "error": "member exceeds the size limit"})
+            continue
+        h, n = hashlib.sha256(), 0
+        try:
+            with zf.open(info) as fh:
+                for b in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(b)
+                    n += len(b)
+        except Exception as exc:  # corrupt member
+            fails.append({"file": path, "error": f"{type(exc).__name__}: {exc}"})
+            continue
+        if h.hexdigest() != meta["sha256"] or n != meta["size"]:
+            fails.append({"file": path, "sealed_sha256": meta["sha256"], "actual_sha256": h.hexdigest(),
+                          "sealed_size": meta["size"], "actual_size": n,
+                          "error": "differs from the SHA-256 sealed in the document"})
+        else:
+            ok += 1
+    return CheckResult(
+        "external_media", not fails,
+        detail=(f"{ok}/{len(external)} media file(s) in the companion archive match the SHA-256 "
+                "sealed in this document" if not fails else f"{len(fails)} media file problem(s)"),
+        extra={"external_files": listing, **({"failures": fails[:20]} if fails else {})})
+
+
 def list_attachments(doc: P.PDFDocument, sealed_end: Optional[int] = None) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     seen = set()
@@ -1306,7 +1388,8 @@ def _match_attachment(path: str, atts: List[Dict[str, Any]]) -> Optional[Dict[st
 
 def verify_sealed_pdf(pdf_bytes: bytes, *, tsl_files: Optional[List[Tuple[str, bytes]]] = None,
                       extra_certs: Optional[List[bytes]] = None,
-                      _doc: Optional[P.PDFDocument] = None) -> VerifyReport:
+                      _doc: Optional[P.PDFDocument] = None,
+                      media_zip: Optional[bytes] = None) -> VerifyReport:
     report = VerifyReport()
     report.bundle_format = "pades-document-timestamp"
     tsl_files = tsl_files or []
@@ -1394,14 +1477,16 @@ def verify_sealed_pdf(pdf_bytes: bytes, *, tsl_files: Optional[List[Tuple[str, b
     report.checks.append(CheckResult("post_seal_changes", ok, detail=detail, extra=extra))
 
     try:
-        return _verify_sealed_tail(doc, report, primary, primary_info, sigs, sig_summ, tsl_files)
+        return _verify_sealed_tail(doc, report, primary, primary_info, sigs, sig_summ, tsl_files,
+                                   media_zip=media_zip)
     except Exception as exc:  # malformed objects must never crash the verifier
         report.checks.append(CheckResult(
             "pdf_objects", False, detail=f"document structure unreadable: {type(exc).__name__}: {exc}"))
         return _finish(report, timestamp=primary_info.summary() if primary_info else None)
 
 
-def _verify_sealed_tail(doc, report, primary, primary_info, sigs, sig_summ, tsl_files) -> VerifyReport:
+def _verify_sealed_tail(doc, report, primary, primary_info, sigs, sig_summ, tsl_files,
+                        media_zip: Optional[bytes] = None) -> VerifyReport:
     # ── attachments ──
     atts = list_attachments(doc, primary.end)
     manifest_att = next((a for a in atts if (a.get("name") or "").lower() == "manifest.json"), None)
@@ -1451,6 +1536,13 @@ def _verify_sealed_tail(doc, report, primary, primary_info, sigs, sig_summ, tsl_
     else:
         report.checks.append(CheckResult("attachments", False, skipped=True, detail="no embedded files"))
 
+    # ── media too large for the PDF (Forensic Browser 1.6.0+) ──
+    # The document seals their SHA-256 (embedded manifest.json external_files,
+    # proof.json, media/NN/media.json); the bytes travel in a companion ZIP.
+    external = _external_files(manifest)
+    if external:
+        report.checks.append(_check_external_media(external, media_zip))
+
     # ── Forensic Browser evidence consistency ──
     proof_att = next((a for a in atts if (a.get("name") or "") == "proof.json"), None)
     proof = _json(proof_att["_data"]) if proof_att else None
@@ -1471,6 +1563,13 @@ def _verify_sealed_tail(doc, report, primary, primary_info, sigs, sig_summ, tsl_
         "/Contents value — including all embedded artefacts — so a VERIFIED verdict proves "
         "the document and its attachments existed in this exact form at genTime.",
     ]
+    if external:
+        notes.append(
+            f"{len(external)} media file(s) are not embedded (too large for the PDF); the document "
+            "seals their SHA-256. "
+            + ("They were checked against the supplied companion archive (check external_media)."
+               if media_zip is not None else
+               "They were NOT checked — pass the companion archive with --media <…_media.zip>."))
     return _finish(report, notes=notes,
                    timestamp=primary_info.summary() if primary_info else None,
                    signatures=sig_summ,
@@ -1525,6 +1624,8 @@ def _check_pdf_evidence(proof, manifest, atts, text, sid) -> CheckResult:
         fails.append({"error": "session id not shown in the document text"})
     cited = set(re.findall(r"\b[0-9a-f]{64}\b", text))
     known = {a["sha256"] for a in atts if a.get("sha256")}
+    # media declared as external in the embedded (sealed) manifest
+    known |= {m["sha256"] for m in _external_files(manifest).values()}
     unknown = sorted(cited - known)
     if unknown:
         fails.append({"error": "document text cites SHA-256 values that match no attachment",
@@ -1856,6 +1957,8 @@ def verify_plain_copy(copy_bytes: bytes, *, original: Optional[bytes] = None,
         for k in ("screenshot_sha256", "page_html_sha256", "mhtml_sha256"):
             if pg.get(k):
                 known.add(pg[k])
+    for f in _media_proof_files(oproof):
+        known.add(f["sha256"])
     files_kind = (oproof or {}).get("format") in FILES_FORMATS
     ctext = ident.get("full_text") or ""
     cited = set(re.findall(r"\b[0-9a-f]{64}\b", ctext)) - {idd.get("sha256")}
@@ -1870,6 +1973,9 @@ def verify_plain_copy(copy_bytes: bytes, *, original: Optional[bytes] = None,
                              if u not in urls_orig and not any(k.startswith(u) for k in urls_orig))
     else:
         urls_orig = {p.get("url") for p in (oproof or {}).get("pages") or []}
+        # video & audio (FB 1.6.0+): the page each media item was preserved from
+        urls_orig |= {m.get("page_url") for m in (oproof or {}).get("media") or []
+                      if isinstance(m, dict) and isinstance(m.get("page_url"), str)}
         url_unknown = sorted(u for u in urls_copy if u not in urls_orig)
     cprobs = []
     if unknown:

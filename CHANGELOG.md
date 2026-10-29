@@ -1,5 +1,35 @@
 # Changelog
 
+## [1.7.2] — 2026-10-29
+
+Forensic Browser 1.6.0 "Video & audio" (`media/NN/` in the evidence).
+
+### Added
+
+- **Check `external_media` and option `--media <…_media.zip>`.** A sealed
+  Forensic Browser PDF whose video/audio was too large to embed lists those
+  files in its embedded `manifest.json` under `external_files` (path,
+  SHA-256, size, companion archive name); the bytes travel in a companion
+  ZIP. With `--media` every listed file is read from the archive and must
+  match the sealed SHA-256 and size; a mismatch or missing file FAILS.
+  Without `--media` the check is skipped and a note says the media were not
+  checked. Python API: `verify_bytes(..., media=bytes)`,
+  `verify_sealed_pdf(..., media_zip=bytes)`.
+
+### Changed
+
+- **Sealed PDF:** SHA-256 values of `external_files` (sealed in the embedded
+  manifest) count as known when checking the digests printed in the
+  document text.
+- **Plain copy (web evidence):** the address of the page a media item was
+  preserved from (`proof.json` `media[].page_url`) and the digests of media
+  files (`media[].files[].sha256`) may be printed on the copy. 1.7.1
+  reported such a copy as inconsistent when the page itself had not been
+  captured.
+
+ZIP packages with media and sealed PDFs with embedded media verified
+unchanged already with 1.7.1 (media files are ordinary sealed files).
+
 ## [1.7.1] — 2026-10-29
 
 Security release for SaaS evidence ZIPs (independent audit of 2026-10-26,
