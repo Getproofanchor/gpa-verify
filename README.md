@@ -32,10 +32,13 @@ and produces a deterministic verdict.
 ## Scope of verification
 
 This tool verifies the **cryptographic seals** on an evidence bundle.
-A successful verdict establishes that the bundle is internally
-consistent, cryptographically intact since sealing, and bound to a
-qualified electronic timestamp from an EU-accredited Trust Service
-Provider.
+A `VERIFIED` verdict establishes that the sealed files are
+cryptographically intact since sealing and bound to a qualified electronic
+timestamp from a qualified trust service provider on the EU Trusted List,
+and that `proof.json` / `manifest.json` agree with the sealed facts. A
+package without a verified qualified timestamp is at most `INTEGRITY ONLY`.
+`report.pdf`, `proof.json` and `manifest.json` are generated at download
+time and are not sealed.
 
 It does **not**, on its own, establish that the screenshot or HTML
 faithfully represent what an ordinary visitor would have seen at the
@@ -72,33 +75,76 @@ GetProofAnchor Evidence Verifier
 ────────────────────────────────────────────────────────────────
   Proof ID:       aeb2b103-d7c5-441c-b540-c0df600a34cf
   Bundle format:  getproofanchor-evidence-2
-  Generated at:   2026-05-07T08:30:25Z
+  Generated at:   2026-05-07T08:32:37Z
 
   [PASS]  bundle_integrity
           31/31 files OK
 
   [PASS]  cross_references
-          5/5 cross-checks OK
-
-  [PASS]  chain_integrity
-          1 entries, all linked
-
+          12/12 cross-checks OK
+  …
   [PASS]  eidas_signature
-          valid RFC3161 token, signed by CN=SK TIMESTAMPING UNIT 2026R,
-          gen_time=2026-05-07T08:30:24+00:00
+          valid RFC3161 token, signed by CN=SK TIMESTAMPING UNIT 2026R, gen_time=2026-05-07T08:30:24+00:00
+  …
+  [INFO]  anchor_witness
+          informational (not independently recomputable): proof entry (seq 230) is itself the anchored head
+  …
+  [PASS]  unlisted_files
+          every file in the ZIP is listed in manifest.json
 
-  [PASS]  anchor_canonical_hash
-          canonical SHA matches manifest (968f0c691384c87c...)
+  [PASS]  sealed_identity
+          proof.json and manifest.json agree with the sealed proof id, URLs, capture time and artifact hashes, capture mode server
 
-  [PASS]  ots_receipt
-          valid OTS proof for anchor SHA 968f0c69..., bitcoin status=pending
-
-  [PASS]  tls_evidence
-          leaf cert SHA-256 matches tls.json (e7668f38708d0411...)
+Sealed facts (from timestamp/eidas_payload.json, bound by the verified qualified timestamp)
+  Proof ID:       aeb2b103-d7c5-441c-b540-c0df600a34cf
+  Source URL:     https://laserplastic.cz/
+  Final URL:      https://laserplastic.cz/
+  Captured at:    2026-05-07T08:30:21Z
+  Time-stamped:   2026-05-07T08:30:24+00:00
+  Capture mode:   server (captured by GetProofAnchor's own browser)  [capture_meta.capture_engine = playwright]
+  Sealed files:   capture/capture_meta.json, content.txt, network/dns.json, …, screenshot.png, timestamp/eidas.tsr, timestamp/eidas_payload.json
+  NOT sealed (generated at download time): README.md, manifest.json, proof.json, report.pdf, timestamp helper files (9)
+  NOT sealed by the qualified timestamp (other): anchor/anchor_payload.json, …
 
 ────────────────────────────────────────────────────────────────
-  ✓ VERIFIED  (7 passed, 0 failed, 0 skipped)
+  ✓ VERIFIED  (10 passed, 0 failed, 3 skipped, 1 info)
+  Time-stamp:     qualified (eIDAS) status NOT checked — use --tsl
 ```
+
+### Verdicts (SaaS evidence ZIP)
+
+| Verdict | Exit | Meaning |
+|---------|------|---------|
+| `✓ VERIFIED` | 0 | No check failed **and** the qualified timestamp `timestamp/eidas.tsr` verified for `timestamp/eidas_payload.json`. |
+| `! INTEGRITY ONLY` | 4 | No check failed, but the package has **no verified qualified timestamp**. The files are only consistent with `manifest.json`, which anyone can recompute after editing them — nothing proves when the evidence existed or that it is unchanged. Since 1.7.1 this is never reported as VERIFIED, also when `proof.json` / `manifest.json` carry no eIDAS markers at all (older proofs without a timestamp get this verdict too, correctly). |
+| `✗ FAILED` | 1 | At least one check failed. |
+
+### Sealed facts — compare the report with them
+
+`report.pdf`, `proof.json`, `manifest.json`, `README.md` and the timestamp
+helper files (`eidas_meta.json`, certificates, Trusted List snapshot, …) are
+**generated when the package is downloaded and are not sealed**. The sealed
+record is `timestamp/eidas_payload.json` together with `timestamp/eidas.tsr`
+and the files whose SHA-256 it lists. When the token verifies, gpa-verify
+prints the **sealed facts** from that payload — proof id, source URL, final
+URL, capture time, time-stamp time, the capture mode derived from the sealed
+`capture/capture_meta.json`, and the list of sealed files — and lists which
+files are not sealed. Compare any report or statement about the proof with
+these lines. For a browser capture it says explicitly that the content was
+supplied by the customer's browser (GetProofAnchor browser extension) and
+sealed by GetProofAnchor on receipt.
+
+Check `sealed_identity` (1.7.1) fails the package when `proof.json` or
+`manifest.json` disagree with the sealed payload — `proof_id`, `source_url`,
+`final_url`, `captured_at` (normalised: `+00:00` → `Z`, fractional seconds
+dropped), the artifact `*_sha256` fields — or when `proof.json`
+`capture.mode` / `capture.source` disagree with the sealed capture mode
+(`file_digest` when `capture_meta.mode` is `file_digest`; `browser` when
+`capture_engine` is `browser_extension`, `extension_version` is present or
+`capture_visibility` is `authenticated_visible`; `server` when
+`capture_engine` is `playwright`). `network/{network_evidence,dns,rdap,tls}.json`
+must equal the network evidence inside the sealed `capture_meta.json`. These
+are the same rules as the GetProofAnchor online verifier.
 
 ### JSON output for automation
 
@@ -110,10 +156,27 @@ gpa-verify --json bundle.zip > report.json
 
 | Code | Meaning |
 |------|---------|
-| 0    | All checks passed |
-| 1    | At least one check failed |
+| 0    | `VERIFIED` — no check failed and a qualified timestamp verified |
+| 1    | `FAILED` — at least one check failed |
 | 2    | Invalid arguments / cannot read input |
-| 3    | Input is not verifiable by itself (unsealed plain copy or unsealed `report.pdf` without `--original`) |
+| 3    | `NOT VERIFIABLE BY ITSELF` — unsealed plain copy, unsealed Forensic Browser `report.pdf` without `--original`, or the unsealed `report.pdf` of a SaaS proof (with or without `--original`) |
+| 4    | `INTEGRITY ONLY` (1.7.1) — no check failed, but no verified qualified timestamp: the files are only consistent with `manifest.json`, which anyone can recompute |
+
+In `--json` output, `summary.verdict` is `VERIFIED`, `FAILED`,
+`INTEGRITY_ONLY` or `NOT_VERIFIABLE`; for SaaS ZIPs `summary.sealed` holds
+the sealed facts (`null` without a verified timestamp) and
+`summary.not_sealed` the unsealed files. A check's `status` is `pass`,
+`fail`, `skip` or `info` (informational, never counted as passed).
+
+### SaaS `report.pdf`
+
+The `report.pdf` inside a SaaS Evidence ZIP is a human-readable summary
+generated at download time; it is not sealed. Given such a report,
+gpa-verify says *"This is the unsealed human-readable report of a SaaS proof
+— verify its Evidence ZIP instead"* (exit 3). With `--original <zip>` it
+compares the report's SHA-256 with `manifest.files["report.pdf"]` and says
+MATCH (still exit 3, never `VERIFIED`: `manifest.json` is not sealed) or NO
+MATCH (`FAILED`, exit 1).
 
 ## Forensic Browser outputs
 
@@ -195,10 +258,20 @@ no extra dependencies.
 
 ## What it actually checks
 
-A SaaS ZIP runs 12 checks (the layers below plus `tsl_qualified`,
-`file_digest`, the informational anchor witness, `anchor_inclusion` and
-`tsa_trust_root`), each tightening the forensic claim.
-**Every check that applies must pass for a `VERIFIED` verdict.**
+A SaaS ZIP runs 14 checks (the layers below plus `tsl_qualified`,
+`file_digest`, the informational anchor witness, `anchor_inclusion`,
+`tsa_trust_root`, and since 1.7.1 `unlisted_files` and `sealed_identity`),
+each tightening the forensic claim.
+**Every check that applies must pass, and the qualified timestamp must
+verify, for a `VERIFIED` verdict** (otherwise `INTEGRITY ONLY`, see above).
+The anchor witness is reported as `INFO` and is not counted as passed.
+
+### Files outside the manifest (`unlisted_files`, 1.7.1)
+
+A file in the ZIP that `manifest.json` does not list (for example an added
+"statement") fails the package, as in the online verifier. Operating-system
+metadata (`.DS_Store`, `Thumbs.db`, `desktop.ini`, `__MACOSX/._*`) is only
+reported.
 
 ### Layer 1 — Bundle integrity
 
@@ -209,8 +282,10 @@ Catches any byte-level tampering with the bundle.
 
 `proof.json`'s SHA-256 claims for `screenshot.png`, `page.html`,
 `content.txt`, and `capture/capture_meta.json` agree with actual file
-contents. Sidecar `*.sha256` files agree. Catches selective tamper that
-fixes one file but forgets another.
+contents. Sidecar `*.sha256` files agree. Since 1.7.1 the copy of the
+capture metadata embedded in `proof.json` (`capture.meta`) must equal
+`capture/capture_meta.json`. Catches selective tamper that fixes one file
+but forgets another.
 
 ### Layer 3 — Chain integrity
 
@@ -323,6 +398,10 @@ verify; see `extra.reasons`), `not_present` (SKIP), `failed` (FAIL).
 | Substitute leaf TLS cert | Layer 7 |
 | Fabricated chain witness (hashes only) | Anchor witness (last seq must equal anchored seq; informational) |
 | Graft another proof's inclusion proof / edit eIDAS payload under a v3 anchor | Anchor inclusion |
+| Edit URL, capture time or proof id in `proof.json` (and so in a regenerated report) | `sealed_identity` |
+| Relabel a browser-extension capture as a server capture (or vice versa) | `sealed_identity` |
+| Add a file to the ZIP without listing it in the manifest | `unlisted_files` |
+| Strip the timestamp and every eIDAS marker, edit content, recompute the manifest | Verdict `INTEGRITY ONLY` (never `VERIFIED`) |
 
 It does **not** verify:
 
@@ -354,8 +433,9 @@ from gpa_verify import verify_evidence_zip
 with open("evidence.zip", "rb") as f:
     report = verify_evidence_zip(f.read())
 
-if report.all_passed:
-    print(f"VERIFIED  proof {report.proof_id}")
+verdict = report.summary["verdict"]   # VERIFIED / INTEGRITY_ONLY / FAILED
+if verdict == "VERIFIED":
+    print(f"VERIFIED  proof {report.proof_id}", report.summary["sealed"]["source_url"])
 else:
     for c in report.checks:
         if not c.passed and not c.skipped:

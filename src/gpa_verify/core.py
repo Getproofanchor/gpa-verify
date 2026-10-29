@@ -74,6 +74,16 @@ Verification layers (each tightens forensic claim):
                                    cover this evidence; grafted inclusion
                                    proofs; edited eIDAS payloads.
 
+1.7.1 additions (server parity, audit 01-D1/D2/D6):
+  unlisted_files    — a file in the ZIP that manifest.json does not list
+                      fails the package (OS metadata is only reported).
+  sealed_identity   — proof.json / manifest.json vs the facts sealed in
+                      timestamp/eidas_payload.json (proof_id, URLs,
+                      captured_at, artifact hashes) and the capture mode
+                      derived from the sealed capture_meta.json.
+  Verdict           — VERIFIED only when the qualified timestamp verified;
+                      without one the verdict is INTEGRITY_ONLY (exit 4).
+
 After all layers pass, the verdict is: this evidence existed in this
 exact form before the eIDAS timestamp's gen_time, was sealed by a
 qualified TSA listed in the EU Trusted List, was anchored to Bitcoin,
@@ -105,12 +115,21 @@ class CheckResult:
     skipped: bool = False
     detail: str = ""
     extra: Dict[str, Any] = field(default_factory=dict)
+    # 1.7.1: an informational result (e.g. anchor_witness) is reported as INFO
+    # and never counted as a passed check; it cannot change the verdict.
+    informational: bool = False
 
     @property
     def status(self) -> str:
         if self.skipped:
             return "skip"
+        if self.passed and self.informational:
+            return "info"
         return "pass" if self.passed else "fail"
+
+    @property
+    def counts_as_pass(self) -> bool:
+        return self.passed and not self.skipped and not self.informational
 
 
 @dataclass
@@ -401,6 +420,20 @@ def check_cross_references(
                     "check": "capture_meta_sidecar",
                     "declared": declared,
                     "actual": actual,
+                })
+
+    # 1.7.1 (same rule as the online verifier): proof.json embeds a copy of
+    # capture_meta; it must equal capture/capture_meta.json.
+    embedded_meta = capture.get("meta") if isinstance(capture, dict) else None
+    if isinstance(embedded_meta, dict):
+        meta_obj = _read_zip_json(zf, "capture/capture_meta.json")
+        if meta_obj is not None:
+            same = embedded_meta == meta_obj
+            checks.append(("capture_meta_embedded", "ok" if same else "fail"))
+            if not same:
+                failures.append({
+                    "check": "capture_meta_embedded",
+                    "error": "proof.json capture.meta differs from capture/capture_meta.json",
                 })
 
     # eidas_payload.sha256 sidecar
@@ -1442,6 +1475,7 @@ def check_anchor_witness(zf: zipfile.ZipFile) -> CheckResult:
             passed=True,
             detail=f"{_WITNESS_PREFIX}proof entry (seq {head.get('seq')}) is itself the anchored head",
             extra=dict(_WITNESS_INFO),
+            informational=True,
         )
 
     raw = _read_zip_text(zf, "chain/anchor_witness.jsonl")
@@ -1535,6 +1569,7 @@ def check_anchor_witness(zf: zipfile.ZipFile) -> CheckResult:
             f"to the anchored head (seq {anchor.get('seq')})"
         ),
         extra=dict(_WITNESS_INFO),
+        informational=True,
     )
 
 
@@ -2098,6 +2133,364 @@ def check_anchor_inclusion(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 1.7.1 — files outside the manifest, sealed facts (server parity)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Ported from the GetProofAnchor online verifier
+# (api/app/services/verify_zip_checks.py: is_os_junk, check_payload_identity,
+# sealed_capture_mode, check_capture_mode, check_network_derivatives and the
+# "extra files" rule of api/app/api/v1/public_verify_zip.py). Keep identical.
+
+VERDICT_VERIFIED = "VERIFIED"
+VERDICT_FAILED = "FAILED"
+VERDICT_INTEGRITY_ONLY = "INTEGRITY_ONLY"
+
+STAMP_FORMATS = frozenset({
+    "getproofanchor-eidas-stamp-3",
+    "getproofanchor-eidas-stamp-4",
+    "getproofanchor-eidas-stamp-5",
+    "getproofanchor-eidas-stamp-6",
+})
+
+# stamped payload field -> archive path
+PAYLOAD_FIELD_FILES: Dict[str, str] = {
+    "screenshot_sha256": "screenshot.png",
+    "raw_html_sha256": "page.html",
+    "content_sha256": "content.txt",
+    "capture_meta_sha256": "capture/capture_meta.json",
+    "har_sha256": "network/capture.har",
+    "video_sha256": "capture.webm",
+    "tls_leaf_pem_sha256": "tls/leaf_cert.pem",
+    "tls_chain_pem_sha256": "tls/chain.pem",
+    "mhtml_sha256": "page.mhtml",
+}
+# Legacy file-digest proofs stored the files-manifest digest in these fields.
+_LEGACY_FILE_DIGEST_ALIASES = {
+    "content_sha256": "files_manifest.json",
+    "raw_html_sha256": "files_manifest.json",
+}
+
+# Written when the package is downloaded; never sealed by the time-stamp.
+GENERATED_AT_DOWNLOAD = ("report.pdf", "proof.json", "manifest.json", "README.md")
+TIMESTAMP_TOKEN_FILES = ("timestamp/eidas.tsr", "timestamp/eidas_payload.json")
+
+BROWSER_CAPTURE_NOTE = (
+    "Browser capture: the page content was supplied by the customer's own browser "
+    "(GetProofAnchor browser extension) and sealed by GetProofAnchor on receipt. "
+    "GetProofAnchor did not observe the page independently."
+)
+INTEGRITY_ONLY_TEXT = (
+    "no qualified timestamp; the files are only consistent with manifest.json, "
+    "which anyone can recompute"
+)
+_EIDAS_UNAFFECTED = " The eIDAS qualified timestamp is unaffected."
+
+
+def is_os_junk(name: str) -> bool:
+    """Metadata added by macOS/Windows when a ZIP is re-packed — nothing else."""
+    base = name.rsplit("/", 1)[-1]
+    if base in (".DS_Store", "Thumbs.db", "desktop.ini"):
+        return True
+    return name.startswith("__MACOSX/") and base.startswith("._")
+
+
+def check_unlisted_files(zf: zipfile.ZipFile, manifest: Dict[str, Any]) -> CheckResult:
+    """Files in the ZIP that manifest.json does not list.
+
+    The online verifier rejects such a package ("extra files present in zip
+    (not in manifest)"); operating-system metadata (.DS_Store, Thumbs.db,
+    desktop.ini, __MACOSX/._*) is only reported."""
+    files_meta = manifest.get("files") if isinstance(manifest.get("files"), dict) else {}
+    allowed = set(files_meta) | {"manifest.json"}
+    unlisted = sorted({n for n in zf.namelist() if not n.endswith("/") and n not in allowed})
+    junk = [n for n in unlisted if is_os_junk(n)]
+    extras = [n for n in unlisted if not is_os_junk(n)]
+    if extras:
+        return CheckResult(
+            name="unlisted_files", passed=False,
+            detail=(f"{len(extras)} file(s) in the ZIP are not listed in manifest.json "
+                    f"(not part of the evidence as issued): {', '.join(extras[:5])}"
+                    + (" …" if len(extras) > 5 else "")),
+            extra={"extras": extras[:50], "os_metadata": junk[:50]},
+        )
+    detail = "every file in the ZIP is listed in manifest.json"
+    if junk:
+        detail += (f"; {len(junk)} operating-system metadata file(s) ignored "
+                   f"({', '.join(junk[:3])}{' …' if len(junk) > 3 else ''})")
+    return CheckResult(name="unlisted_files", passed=True, detail=detail,
+                       extra={"os_metadata": junk[:50]} if junk else {})
+
+
+def _norm_time(v: Any) -> Any:
+    if not isinstance(v, str):
+        return v
+    s = v.strip().replace("+00:00", "Z")
+    return re.sub(r"\.\d+(?=Z$)", "", s)
+
+
+def sealed_capture_mode(capture_meta: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Capture mode derived from the sealed capture_meta (not from proof.json)."""
+    if not isinstance(capture_meta, dict):
+        return None
+    if capture_meta.get("mode") == "file_digest":
+        return "file_digest"
+    engine = capture_meta.get("capture_engine")
+    # Browser uploads before 2026-10-23 sealed a client-supplied engine; the
+    # extension-only fields still mark them as browser captures.
+    if (engine == "browser_extension" or capture_meta.get("extension_version")
+            or capture_meta.get("capture_visibility") == "authenticated_visible"):
+        return "browser"
+    if engine == "playwright":
+        return "server"
+    return None
+
+
+def _payload_identity_problems(payload: Dict[str, Any], proof: Optional[Dict[str, Any]],
+                               manifest_proof_id: Any) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    pid = payload.get("proof_id")
+    if manifest_proof_id is not None and pid != manifest_proof_id:
+        out.append({"field": "proof_id", "file": "manifest.json",
+                    "error": "stamped payload belongs to a different proof (proof_id differs from manifest.json)",
+                    "sealed": pid, "found": manifest_proof_id})
+    if proof is not None and "proof_id" in proof and proof.get("proof_id") != pid:
+        out.append({"field": "proof_id", "file": "proof.json",
+                    "error": "proof.json proof_id differs from the stamped payload",
+                    "sealed": pid, "found": proof.get("proof_id")})
+    if proof is not None:
+        for key in ("source_url", "final_url", "captured_at"):
+            if key in payload and key in proof:
+                a, b = payload.get(key), proof.get(key)
+                if key == "captured_at":
+                    a, b = _norm_time(a), _norm_time(b)
+                if a != b:
+                    out.append({"field": key, "file": "proof.json",
+                                "error": f"proof.json {key} differs from the eIDAS-sealed payload",
+                                "sealed": payload.get(key), "found": proof.get(key)})
+        for fld in PAYLOAD_FIELD_FILES:
+            if fld in payload and payload.get(fld) and proof.get(fld) \
+                    and proof.get(fld) != payload.get(fld):
+                out.append({"field": fld, "file": "proof.json",
+                            "error": f"proof.json {fld} differs from the eIDAS-sealed payload",
+                            "sealed": payload.get(fld), "found": proof.get(fld)})
+    return out
+
+
+def _capture_mode_problems(sealed_mode: Optional[str], proof: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    if sealed_mode is None or not isinstance(proof, dict):
+        return out
+    cap = proof.get("capture") if isinstance(proof.get("capture"), dict) else {}
+    mode, source = cap.get("mode"), cap.get("source")
+    if mode is not None and mode != sealed_mode:
+        out.append({"field": "capture.mode", "file": "proof.json",
+                    "error": "proof.json capture.mode differs from the eIDAS-sealed capture_meta",
+                    "sealed": sealed_mode, "found": mode})
+    if source is not None and (source == "browser_extension") != (sealed_mode == "browser"):
+        out.append({"field": "capture.source", "file": "proof.json",
+                    "error": "proof.json capture.source differs from the eIDAS-sealed capture_meta",
+                    "sealed": "browser_extension" if sealed_mode == "browser" else "not browser_extension",
+                    "found": source})
+    return out
+
+
+def _dumps_indent(obj: Any) -> bytes:
+    return json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def _network_derivative_problems(zf: zipfile.ZipFile, capture_meta: Optional[Dict[str, Any]]
+                                 ) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """network/{network_evidence,dns,rdap,tls}.json are split out of the sealed
+    capture_meta.interaction_summary.network_evidence. Returns (problems, sealed paths)."""
+    problems: List[Dict[str, Any]] = []
+    derived: List[str] = []
+    net = None
+    if isinstance(capture_meta, dict) and isinstance(capture_meta.get("interaction_summary"), dict):
+        net = capture_meta["interaction_summary"].get("network_evidence")
+    expected: Dict[str, List[Any]] = {}
+    if isinstance(net, dict):
+        dns_obj, rdap_obj, tls_obj = net.get("dns"), net.get("rdap"), net.get("tls")
+        summary = {
+            "format": net.get("format"),
+            "captured_at_utc": net.get("captured_at_utc"),
+            "target_url": net.get("target_url"),
+            "target_hostname": net.get("target_hostname"),
+            "dns_present": dns_obj is not None,
+            "rdap_present": rdap_obj is not None,
+            "tls_present": tls_obj is not None,
+        }
+        expected["network/network_evidence.json"] = [summary, net]
+        if dns_obj is not None:
+            expected["network/dns.json"] = [dns_obj]
+        if rdap_obj is not None:
+            expected["network/rdap.json"] = [rdap_obj]
+        if tls_obj is not None:
+            expected["network/tls.json"] = [tls_obj]
+    names = set(zf.namelist())
+    for path in ("network/network_evidence.json", "network/dns.json", "network/rdap.json", "network/tls.json"):
+        if path not in names:
+            continue
+        raw = _read_zip_file(zf, path)
+        cands = expected.get(path)
+        ok = False
+        if raw is not None and cands:
+            if any(raw == _dumps_indent(c) for c in cands):
+                ok = True
+            else:
+                try:
+                    parsed = json.loads(raw.decode("utf-8"))
+                    ok = any(parsed == c for c in cands)
+                except Exception:
+                    ok = False
+        if ok:
+            derived.append(path)
+        else:
+            problems.append({"field": "network_evidence", "file": path,
+                             "error": f"{path} does not match the network evidence inside the "
+                                      "eIDAS-sealed capture/capture_meta.json"})
+    return problems, derived
+
+
+def check_sealed_identity(
+    zf: zipfile.ZipFile,
+    manifest: Dict[str, Any],
+    proof: Optional[Dict[str, Any]],
+    eidas_check: Optional[CheckResult],
+) -> CheckResult:
+    """proof.json / manifest.json vs the facts sealed by the qualified timestamp.
+
+    Only a payload whose RFC 3161 token verified (eidas_signature PASS) is a
+    statement of what was sealed. Compares proof_id (proof.json and
+    manifest.json), source_url, final_url, captured_at and the artifact hashes
+    with timestamp/eidas_payload.json, and proof.json capture.mode /
+    capture.source with the mode derived from the sealed
+    capture/capture_meta.json. extra["sealed"] carries the sealed facts."""
+    name = "sealed_identity"
+    if eidas_check is None or not eidas_check.passed or eidas_check.skipped:
+        return CheckResult(
+            name=name, passed=False, skipped=True,
+            detail="no verified qualified timestamp — nothing in this package is sealed, "
+                   "so proof.json cannot be compared with sealed facts",
+        )
+    payload = _read_zip_json(zf, "timestamp/eidas_payload.json")
+    if payload is None:
+        return CheckResult(name=name, passed=False,
+                           detail="timestamp/eidas_payload.json is not a JSON object")
+    fmt = payload.get("format")
+    if fmt not in STAMP_FORMATS:
+        return CheckResult(
+            name=name, passed=False,
+            detail=f"stamped payload has an unknown format ({str(fmt)[:60]}); "
+                   "the sealed facts cannot be determined",
+        )
+
+    problems = _payload_identity_problems(payload, proof, manifest.get("proof_id"))
+
+    # Which archive files does the payload bind (hash equal)?
+    names = set(zf.namelist())
+    proof_mode = ((proof or {}).get("capture") or {}).get("mode") if isinstance(
+        (proof or {}).get("capture"), dict) else None
+    file_digest_mode = proof_mode == "file_digest" or (
+        _read_zip_json(zf, "capture/capture_meta.json") or {}).get("mode") == "file_digest"
+    sealed_files: Dict[str, str] = {}
+    for fld, path in PAYLOAD_FIELD_FILES.items():
+        exp = payload.get(fld)
+        if not isinstance(exp, str) or not exp:
+            continue
+        exp = exp.strip().lower()
+        data = _read_zip_file(zf, path) if path in names else None
+        if data is not None and _sha256(data) == exp:
+            sealed_files[path] = fld
+            continue
+        alias = _LEGACY_FILE_DIGEST_ALIASES.get(fld)
+        if alias and alias in names and file_digest_mode:
+            adata = _read_zip_file(zf, alias)
+            if adata is not None and _sha256(adata) == exp:
+                sealed_files[alias] = fld
+        # a missing or different bound file is already a FAIL in cross_references
+
+    capture_meta = None
+    sealed_mode = None
+    mode_basis = None
+    if "capture/capture_meta.json" in sealed_files:
+        capture_meta = _read_zip_json(zf, "capture/capture_meta.json")
+        sealed_mode = sealed_capture_mode(capture_meta)
+        if sealed_mode:
+            cm = capture_meta or {}
+            if sealed_mode == "file_digest":
+                mode_basis = "capture_meta.mode = file_digest"
+            elif sealed_mode == "browser":
+                mode_basis = ("capture_meta.capture_engine = browser_extension"
+                              if cm.get("capture_engine") == "browser_extension" else
+                              "capture_meta.extension_version present"
+                              if cm.get("extension_version") else
+                              "capture_meta.capture_visibility = authenticated_visible")
+            else:
+                mode_basis = "capture_meta.capture_engine = playwright"
+        problems.extend(_capture_mode_problems(sealed_mode, proof))
+        net_problems, derived = _network_derivative_problems(zf, capture_meta)
+        problems.extend(net_problems)
+        for p in derived:
+            sealed_files[p] = "capture_meta_sha256 (derived)"
+
+    gen_time = (eidas_check.extra or {}).get("gen_time")
+    facts: Dict[str, Any] = {
+        "proof_id": payload.get("proof_id"),
+        "source_url": payload.get("source_url"),
+        "final_url": payload.get("final_url"),
+        "captured_at": payload.get("captured_at"),
+        "timestamp_gen_time": gen_time,
+        "payload_format": fmt,
+        "capture_mode": sealed_mode,
+        "capture_mode_basis": mode_basis,
+        "sealed_files": sorted(sealed_files) + list(TIMESTAMP_TOKEN_FILES),
+    }
+    if sealed_mode == "browser":
+        facts["capture_note"] = BROWSER_CAPTURE_NOTE
+
+    extra: Dict[str, Any] = {"sealed": facts}
+    if problems:
+        extra["mismatches"] = [
+            f"{p['file']} {p['field']}: found {str(p.get('found'))[:120]!s} — sealed {str(p.get('sealed'))[:120]!s}"
+            if "found" in p else f"{p['file']}: {p['error']}"
+            for p in problems
+        ]
+        extra["problems"] = problems
+        return CheckResult(
+            name=name, passed=False,
+            detail=f"{len(problems)} difference(s) from the eIDAS-sealed facts: "
+                   + "; ".join(p["error"] for p in problems[:3]),
+            extra=extra,
+        )
+    mode_txt = f", capture mode {sealed_mode}" if sealed_mode else ", capture mode not sealed"
+    return CheckResult(
+        name=name, passed=True,
+        detail=("proof.json and manifest.json agree with the sealed proof id, URLs, capture "
+                f"time and artifact hashes{mode_txt}"),
+        extra=extra,
+    )
+
+
+def _unsealed_inventory(zf: zipfile.ZipFile, manifest: Dict[str, Any],
+                        sealed: Optional[Dict[str, Any]]) -> Dict[str, List[str]]:
+    """Which files of the package are NOT covered by the qualified timestamp."""
+    files_meta = manifest.get("files") if isinstance(manifest.get("files"), dict) else {}
+    present = sorted(set(files_meta) | {"manifest.json"})
+    sealed_set = set((sealed or {}).get("sealed_files") or [])
+    generated, helpers, other = [], [], []
+    for n in present:
+        if n in sealed_set:
+            continue
+        if n in GENERATED_AT_DOWNLOAD:
+            generated.append(n)
+        elif n.startswith("timestamp/") and n not in TIMESTAMP_TOKEN_FILES:
+            helpers.append(n)
+        else:
+            other.append(n)
+    return {"generated_at_download": generated, "timestamp_helpers": helpers, "other": other}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Public entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -2176,19 +2569,51 @@ def verify_evidence_zip(
         ))
 
     report.checks.append(check_tsa_trust_root(zf, manifest))     # 1.6.0 — appended last
+    # 1.7.1 — appended after the 1.6.0 checks
+    report.checks.append(check_unlisted_files(zf, manifest))
+    report.checks.append(check_sealed_identity(zf, manifest, proof, _eidas))
+
+    timestamp_verified = bool(_eidas is not None and _eidas.passed and not _eidas.skipped)
+    if not timestamp_verified:
+        # "unaffected" is only true when the qualified timestamp verified (01-D1)
+        for c in report.checks:
+            if _EIDAS_UNAFFECTED in c.detail:
+                c.detail = c.detail.replace(_EIDAS_UNAFFECTED, "")
+
+    sealed_check = next(c for c in report.checks if c.name == "sealed_identity")
+    sealed = sealed_check.extra.get("sealed") if timestamp_verified else None
+
+    any_failed = report.any_failed
+    if any_failed or not any(c.counts_as_pass for c in report.checks):
+        verdict = VERDICT_FAILED
+    elif timestamp_verified:
+        verdict = VERDICT_VERIFIED
+    else:
+        verdict = VERDICT_INTEGRITY_ONLY
+
+    notes: List[str] = []
+    if verdict == VERDICT_INTEGRITY_ONLY:
+        notes.append("INTEGRITY ONLY: " + INTEGRITY_ONLY_TEXT + ". Nothing in this package "
+                     "proves when the evidence existed or that it is unchanged since capture.")
+    # (the browser-capture statement is part of summary["sealed"]["capture_note"])
+    notes.append("report.pdf, proof.json, manifest.json, README.md and the timestamp helper files "
+                 "are generated when the package is downloaded and are NOT sealed. Only "
+                 "timestamp/eidas_payload.json (with timestamp/eidas.tsr) and the files whose "
+                 "digests it lists are sealed; compare any report with the sealed facts.")
 
     # Build summary
     from .forensic_browser import qualified_status
     report.summary = {
         "checks_total": len(report.checks),
-        "checks_passed": sum(1 for c in report.checks if c.passed),
+        "checks_passed": sum(1 for c in report.checks if c.counts_as_pass),
         "checks_failed": sum(1 for c in report.checks if not c.passed and not c.skipped),
         "checks_skipped": sum(1 for c in report.checks if c.skipped),
-        "verdict": (
-            "VERIFIED"
-            if report.all_passed and not report.any_failed
-            else "FAILED"
-        ),
+        "checks_info": sum(1 for c in report.checks if c.status == "info"),
+        "verdict": verdict,
+        # 1.7.1: facts sealed by the verified qualified timestamp (None without one)
+        "sealed": sealed,
+        "not_sealed": _unsealed_inventory(zf, manifest, sealed),
+        "notes": notes,
         # 1.6.0 (additive): anchor v3 content binding — verified / not_present / failed
         "anchor_inclusion": next(
             (c.extra.get("result") for c in report.checks if c.name == "anchor_inclusion"), None

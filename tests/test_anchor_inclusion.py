@@ -312,12 +312,14 @@ def test_tsr_stripped_from_real_bundle_fails():
         assert not _check(report, "eidas_signature").skipped
 
 
-def test_bundle_without_qualified_timestamp_still_verifies():
+def test_bundle_without_qualified_timestamp_is_integrity_only():
     """Proofs without eIDAS (free plan) carry eidas_payload.json but declare no
-    timestamp: they keep their 1.5.0 verdict."""
+    timestamp. Nothing fails, but since 1.7.1 (audit 01-D1) they are never
+    VERIFIED: the verdict is INTEGRITY_ONLY."""
     report = verify_evidence_zip(V3_NONE.read_bytes())
     assert _check(report, "eidas_signature").skipped
-    assert report.summary["verdict"] == "VERIFIED"
+    assert not report.any_failed
+    assert report.summary["verdict"] == "INTEGRITY_ONLY"
 
 
 def test_forged_tstinfo_rejected():
@@ -349,7 +351,7 @@ def test_bundle_without_inclusion_is_skipped(fx):
     report = verify_evidence_zip(fx.read_bytes())
     c = _check(report, "anchor_inclusion")
     assert c.skipped and c.extra["result"] == "not_present"
-    assert report.summary["verdict"] == "VERIFIED"
+    assert report.summary["verdict"] == ("INTEGRITY_ONLY" if fx == V3_NONE else "VERIFIED")
     assert report.summary["anchor_inclusion"] == "not_present"
 
 
@@ -422,7 +424,8 @@ def test_json_schema_additive():
     d = verify_evidence_zip(V3_SAME.read_bytes()).to_dict()
     assert set(d) == {"proof_id", "bundle_format", "generated_at", "all_passed", "checks", "summary"}
     assert {"checks_total", "checks_passed", "checks_failed", "checks_skipped", "verdict"} <= set(d["summary"])
-    # 1.5.0 checks keep their positions; 1.6.0 checks are appended at the end
-    assert [c["name"] for c in d["checks"]][-2:] == ["anchor_inclusion", "tsa_trust_root"]
+    # 1.5.0 checks keep their positions; 1.6.0 and then 1.7.1 checks are appended at the end
+    assert [c["name"] for c in d["checks"]][-4:] == ["anchor_inclusion", "tsa_trust_root",
+                                                     "unlisted_files", "sealed_identity"]
     for c in d["checks"]:
         assert {"name", "status", "detail"} <= set(c)

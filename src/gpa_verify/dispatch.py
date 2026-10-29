@@ -6,6 +6,7 @@ gpa_verify.dispatch — auto-detect the input kind and route it.
   PAdES sealed PDF             → forensic_browser.verify_sealed_pdf
   Unsealed plain copy PDF      → forensic_browser.verify_plain_copy
   Unsealed package report PDF  → forensic_browser.verify_fb_report
+  Unsealed SaaS report.pdf     → forensic_browser.verify_saas_report (1.7.1)
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from .core import CheckResult, VerifyReport
 
 def detect_kind(data: bytes) -> str:
     """Return one of: saas_zip, fb_zip, zip_unknown, sealed_pdf, plain_copy,
-    fb_report, pdf_unsigned, pdf_damaged, unknown."""
+    fb_report, saas_report, pdf_unsigned, pdf_damaged, unknown."""
     if data[:4] == b"PK\x03\x04" or data[:4] == b"PK\x05\x06":
         try:
             zf = zipfile.ZipFile(io.BytesIO(data))
@@ -50,6 +51,13 @@ def detect_kind(data: bytes) -> str:
             return "sealed_pdf" if b"/ByteRange" in data else "pdf_damaged"
         k = {"sealed": "sealed_pdf", "plain_copy": "plain_copy",
              "fb_report": "fb_report"}.get(c, "pdf_unsigned")
+        if k == "pdf_unsigned":
+            from .forensic_browser import saas_report_identification
+            try:
+                if saas_report_identification(doc) is not None:
+                    return "saas_report"   # 1.7.1 (01-D10)
+            except Exception:
+                pass
         if k == "pdf_unsigned" and any("rebuilt" in w for w in doc.warnings):
             return "pdf_damaged"
         if k == "pdf_unsigned" and (b"/ByteRange" in data or b"ETSI.RFC3161" in data):
@@ -112,6 +120,8 @@ def _route(kind, data, original, original_name, tsl, certs, bitcoin_rpc) -> Veri
                                     tsl_files=tsl, extra_certs=certs)
     if kind == "fb_report":
         return FB.verify_fb_report(data, original=original)
+    if kind == "saas_report":
+        return FB.verify_saas_report(data, original=original)
     rep = VerifyReport(bundle_format="unknown")
     rep.checks.append(CheckResult(
         "input_format", False,

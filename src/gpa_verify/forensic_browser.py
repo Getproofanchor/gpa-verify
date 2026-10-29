@@ -1931,3 +1931,108 @@ def verify_fb_report(pdf_bytes: bytes, *, original: Optional[bytes] = None) -> V
     return _finish(report, notes=[
         "The report matches the package manifest. manifest.json is not time-stamped, so this "
         "shows consistency, not sealing; the evidence is the sealed files of the package."])
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 4. Unsealed report.pdf of a SaaS proof (1.7.1, audit 01-D10)
+# ═════════════════════════════════════════════════════════════════════════════
+
+_UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
+SAAS_REPORT_MESSAGE = ("This is the unsealed human-readable report of a SaaS proof — "
+                       "verify its Evidence ZIP instead")
+
+
+def saas_report_identification(doc: P.PDFDocument) -> Optional[Dict[str, Any]]:
+    """{'proof_id': …} when the PDF is the report.pdf of a GetProofAnchor SaaS
+    evidence package ("GetProofAnchor Evidence Report", Proof ID), else None."""
+    def _txt(v: Any) -> str:
+        if isinstance(v, bytes):
+            return v.decode("latin-1", "replace")
+        return _name_text(v) or (v if isinstance(v, str) else "")
+    try:
+        title = _txt(doc.info.get("Title"))
+        author = _txt(doc.info.get("Author"))
+    except Exception:
+        title = author = ""
+    try:
+        text = "\n".join(P.extract_text(doc)[:2])
+    except Exception:
+        text = ""
+    meta_hit = "GetProofAnchor Evidence Report" in title or (
+        "GetProofAnchor" in author and "Evidence Report" in title)
+    text_hit = "GetProofAnchor" in text and "Evidence Report" in text and "Proof ID" in text
+    if not (meta_hit or text_hit):
+        return None
+    pid = None
+    m = re.search(r"Proof ID\s*\n?\s*(" + _UUID_RE.pattern + ")", text)
+    if m:
+        pid = m.group(1)
+    else:
+        m = _UUID_RE.search(title) or _UUID_RE.search(text)
+        pid = m.group(0) if m else None
+    return {"proof_id": pid, "title": title or None}
+
+
+def verify_saas_report(pdf_bytes: bytes, *, original: Optional[bytes] = None) -> VerifyReport:
+    """The report.pdf of a SaaS Evidence ZIP is generated at download time and
+    is not sealed. Never VERIFIED: alone → NOT_VERIFIABLE; with --original
+    <zip> its SHA-256 is compared with manifest.files['report.pdf'] (match →
+    NOT_VERIFIABLE with the match stated, no match → FAILED)."""
+    report = VerifyReport()
+    report.bundle_format = "getproofanchor-saas-report (unsealed)"
+    try:
+        ident = saas_report_identification(P.PDFDocument(pdf_bytes)) or {}
+    except Exception:
+        ident = {}
+    report.proof_id = ident.get("proof_id")
+    report.checks.append(CheckResult(
+        "report_integrity", False, skipped=True,
+        detail="unsealed report — generated when the Evidence ZIP was downloaded; it carries no "
+               "seal and is not verifiable by itself"))
+    sha = _sha256(pdf_bytes)
+    base_notes = [
+        SAAS_REPORT_MESSAGE + ": gpa-verify GetProofAnchor_Evidence_<proof id>.zip",
+        "Compare what the report states (proof id, URLs, capture time, capture mode) with the "
+        "'Sealed facts' that gpa-verify prints for the ZIP.",
+    ]
+    if original is None:
+        return _finish(report, verdict=VERDICT_NOT_VERIFIABLE, notes=base_notes,
+                       report_sha256=sha, message=SAAS_REPORT_MESSAGE)
+
+    probs: List[str] = []
+    zip_pid = None
+    zip_verdict = None
+    expected = None
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(original))
+        from .core import _read_zip_json
+        man = _read_zip_json(zf, "manifest.json") or {}
+        zip_pid = man.get("proof_id")
+        ent = (man.get("files") or {}).get("report.pdf") if isinstance(man.get("files"), dict) else None
+        expected = ent.get("sha256") if isinstance(ent, dict) else None
+        if not expected:
+            probs.append("the package's manifest.json lists no report.pdf")
+        elif expected != sha:
+            probs.append("NO MATCH: the report differs from the report.pdf listed in the package "
+                         f"manifest (SHA-256 {sha[:16]}… ≠ {str(expected)[:16]}…)")
+        from .core import verify_evidence_zip
+        zip_verdict = verify_evidence_zip(original).summary.get("verdict")
+    except Exception as exc:
+        probs.append(f"cannot read the package: {type(exc).__name__}: {exc}")
+    if report.proof_id and zip_pid and report.proof_id != zip_pid:
+        probs.append(f"report proof id {report.proof_id} ≠ package proof id {zip_pid}")
+    report.checks.append(CheckResult(
+        "report_binding", not probs,
+        detail=("MATCH: the report is byte-identical to the report.pdf listed in the package's "
+                "manifest.json (SHA-256 " + sha[:16] + "…)" if not probs else "; ".join(probs)),
+        extra={"report_sha256": sha, "manifest_report_sha256": expected,
+               "package_proof_id": zip_pid, "package_verdict": zip_verdict}))
+    notes = [
+        "manifest.json is not sealed, so a match shows only that this is the report shipped "
+        "in that package — not that the report's statements are true. The evidence is the "
+        "sealed files of the package.",
+        f"The Evidence ZIP itself: {zip_verdict or 'not verified'} (run gpa-verify on the ZIP "
+        "for details and its sealed facts).",
+    ] + base_notes
+    return _finish(report, verdict=VERDICT_NOT_VERIFIABLE, notes=notes, report_sha256=sha,
+                   message=SAAS_REPORT_MESSAGE, package_verdict=zip_verdict)

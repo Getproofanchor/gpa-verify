@@ -1,5 +1,68 @@
 # Changelog
 
+## [1.7.1] — 2026-10-29
+
+Security release for SaaS evidence ZIPs (independent audit of 2026-10-26,
+findings 01-D1, 01-D2, 01-D6, 01-D10, 01 N16, rv-O1). Forensic Browser
+verification is unchanged.
+
+### Security
+
+- **No qualified timestamp → never `VERIFIED` (01-D1, rv-O1).** A package
+  whose `timestamp/eidas.tsr` is absent got `✓ VERIFIED` when the eIDAS
+  markers in `proof.json` / `manifest.json` had been removed too — even with
+  an edited screenshot and content and a recomputed manifest. Such a package
+  is now reported as `INTEGRITY ONLY — no qualified timestamp; the files are
+  only consistent with manifest.json, which anyone can recompute`
+  (`summary.verdict = "INTEGRITY_ONLY"`, **exit code 4**). Genuine older
+  packages without a timestamp get the same verdict. "The eIDAS qualified
+  timestamp is unaffected" is no longer printed when no timestamp verified.
+- **New check `sealed_identity` (01-D2)**, ported from the online verifier
+  (`check_payload_identity`, `sealed_capture_mode`, `check_capture_mode`,
+  `check_network_derivatives`). When the token verifies, `proof.json` and
+  `manifest.json` must agree with `timestamp/eidas_payload.json`:
+  `proof_id` (also vs `manifest.json`), `source_url`, `final_url`,
+  `captured_at` (normalised as the server does) and the artifact `*_sha256`
+  fields; `proof.json` `capture.mode` / `capture.source` must agree with the
+  mode derived from the sealed `capture/capture_meta.json` (file_digest /
+  browser / server); `network/*.json` must equal the network evidence in the
+  sealed capture metadata. An edited URL or capture time, or a browser
+  capture relabelled as a server capture, now FAILS.
+- **New check `unlisted_files` (01-D6).** Files in the ZIP that
+  `manifest.json` does not list fail the package, as in the online verifier;
+  OS metadata (`.DS_Store`, `Thumbs.db`, `desktop.ini`, `__MACOSX/._*`) is
+  only reported.
+- `cross_references`: the `capture.meta` copy in `proof.json` must equal
+  `capture/capture_meta.json` (online-verifier rule).
+
+### Added
+
+- **Sealed facts** in the human output and in `--json`
+  (`summary.sealed`): proof id, source URL, final URL, capture time,
+  time-stamp time, sealed capture mode (with the field it is derived from),
+  sealed files, and for browser captures the statement that the content was
+  supplied by the customer's browser and sealed on receipt.
+  `summary.not_sealed` lists the files that are not sealed; the output states
+  that `report.pdf`, `proof.json`, `manifest.json`, `README.md` and the
+  timestamp helper files are generated at download time and are NOT sealed.
+- **SaaS `report.pdf` (01-D10).** Recognised by its title / text
+  ("GetProofAnchor Evidence Report", Proof ID); reported as *"This is the
+  unsealed human-readable report of a SaaS proof — verify its Evidence ZIP
+  instead"* (`NOT_VERIFIABLE`, exit 3) instead of an `input_format` failure.
+  With `--original <zip>` its SHA-256 is compared with
+  `manifest.files["report.pdf"]`: MATCH (exit 3, never VERIFIED) or NO MATCH
+  (FAILED, exit 1).
+- Exit codes are documented in `--help`.
+
+### Changed
+
+- **`anchor_witness` is reported as `INFO` (01 N16)** and no longer counted
+  in "N passed"; new `summary.checks_info`, check status `info`.
+  `checks_passed` counts only checks that actually passed (a skipped
+  `ots_receipt` was counted as passed before).
+- A SaaS ZIP now runs 14 checks; `unlisted_files` and `sealed_identity` are
+  appended after the 1.6.0 checks.
+
 ## [1.7.0] — 2026-10-22
 
 ### Added
