@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.7.3] — 2026-10-29
+
+### Changed
+
+- **Companion media archive given on its own.** `gpa-verify …_media.zip`
+  (the archive Forensic Browser 1.6+ writes next to a sealed PDF when video or
+  audio is too large to embed) used to end in `FAILED manifest_load`. It is now
+  recognised (README.txt title + only `media/` entries) and reported as
+  **NOT VERIFIABLE BY ITSELF** (exit 3) with the exact command to run:
+  `gpa-verify <sealed PDF> --media <this archive>`.
+- `gpa-verify …_media.zip --original <sealed PDF>` runs the same verification
+  as `<sealed PDF> --media …_media.zip`; an `--original` that is not a sealed
+  PDF (e.g. the unsealed plain copy) fails with check `original_kind`.
+
+No change for any other input. Tests: 236 passed (6 new in
+`tests/test_release_173.py`).
+
 ## [1.7.2] — 2026-10-29
 
 Forensic Browser 1.6.0 "Video & audio" (`media/NN/` in the evidence).

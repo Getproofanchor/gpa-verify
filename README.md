@@ -191,6 +191,7 @@ gpa-verify GetProofAnchor_sess-1792572400480_bez-pecete.pdf \
            --original GetProofAnchor_sess-1792572400480.pdf # unsealed copy vs. original
 gpa-verify GetProofAnchor_sess-1792572400480.pdf \
            --media GetProofAnchor_sess-1792572400480_media.zip  # video too large for the PDF (1.7.2)
+gpa-verify GetProofAnchor_sess-1792572400480_media.zip       # alone: NOT VERIFIABLE + the command to run (1.7.3)
 ```
 
 | Input | What a `VERIFIED` verdict proves |

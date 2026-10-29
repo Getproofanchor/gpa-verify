@@ -16,7 +16,7 @@ Exit codes:
     0  — VERIFIED: no check failed and a qualified timestamp verified
     1  — FAILED: at least one check failed
     2  — invalid arguments / cannot read input
-    3  — NOT VERIFIABLE BY ITSELF: unsealed plain copy or unsealed report.pdf
+    3  — NOT VERIFIABLE BY ITSELF: unsealed plain copy, unsealed report.pdf or companion media archive
          (with or without --original)
     4  — INTEGRITY ONLY (1.7.1): no check failed, but the package carries no
          verified qualified timestamp; the files are only consistent with
@@ -178,7 +178,7 @@ _EPILOG = """exit codes:
   0  VERIFIED — no check failed and a qualified timestamp verified
   1  FAILED — at least one check failed
   2  invalid arguments / cannot read input
-  3  NOT VERIFIABLE BY ITSELF — unsealed plain copy or unsealed report.pdf
+  3  NOT VERIFIABLE BY ITSELF — unsealed plain copy, unsealed report.pdf or companion media archive
   4  INTEGRITY ONLY — no check failed, but there is no verified qualified
      timestamp: the files are only consistent with manifest.json, which
      anyone can recompute
@@ -328,7 +328,7 @@ def main(argv: list[str] | None = None) -> int:
     verdict = report.summary.get("verdict")
     not_verifiable = verdict == "NOT_VERIFIABLE"
     integrity_only = verdict == "INTEGRITY_ONLY"
-    if args.original and _kind not in ("plain_copy", "fb_report", "saas_report"):
+    if args.original and _kind not in ("plain_copy", "fb_report", "saas_report", "fb_media_zip"):
         print(f"warning: --original is ignored for this input ({_kind})", file=sys.stderr)
     if args.media and _kind != "sealed_pdf":
         print(f"warning: --media is ignored for this input ({_kind})", file=sys.stderr)
@@ -345,7 +345,9 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"FAIL  {c.name}: {c.detail}", file=sys.stderr)
         elif not_verifiable:
             msg = ("unsealed SaaS report — verify its Evidence ZIP instead"
-                   if _kind == "saas_report" else "unsealed copy — pass --original <sealed file>")
+                   if _kind == "saas_report" else
+                   "companion media archive — run: gpa-verify <sealed PDF> --media <this archive>"
+                   if _kind == "fb_media_zip" else "unsealed copy — pass --original <sealed file>")
             print(f"NOT VERIFIABLE: {msg}", file=sys.stderr)
         elif integrity_only:
             print(f"INTEGRITY ONLY: {INTEGRITY_ONLY_TEXT}", file=sys.stderr)

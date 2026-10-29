@@ -2044,6 +2044,86 @@ def verify_fb_report(pdf_bytes: bytes, *, original: Optional[bytes] = None) -> V
 # ═════════════════════════════════════════════════════════════════════════════
 
 _UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
+MEDIA_COMPANION_TITLE = "GetProofAnchor Forensic Browser — companion media archive"
+MEDIA_COMPANION_MESSAGE = ("This is the companion media archive of a sealed Forensic Browser PDF — "
+                           "it carries no seal; verify the PDF with --media <this archive>")
+
+
+def media_companion_identification(zf: "zipfile.ZipFile") -> Optional[Dict[str, Any]]:
+    """1.7.3: recognise the companion …_media.zip that Forensic Browser 1.6+
+    writes next to a sealed PDF when video/audio is too large to embed.
+
+    Identified by its README.txt title and by every other entry lying under
+    media/. Returns {session_id, sealed_document, files} or None.
+    """
+    try:
+        names = [i.filename for i in zf.infolist() if not i.is_dir()]
+    except Exception:
+        return None
+    if "README.txt" not in names:
+        return None
+    others = [n for n in names if n != "README.txt"]
+    if not others or not all(n.startswith("media/") for n in others):
+        return None
+    try:
+        info = zf.getinfo("README.txt")
+        if info.file_size > 1 << 20:
+            return None
+        text = zf.read("README.txt").decode("utf-8", "replace")
+    except Exception:
+        return None
+    if not text.lstrip().startswith(MEDIA_COMPANION_TITLE):
+        return None
+    def _field(label: str) -> Optional[str]:
+        m = re.search(r"^" + re.escape(label) + r":\s*(\S[^\r\n]{0,300})$", text, re.M)
+        return m.group(1).strip() if m else None
+    return {"session_id": _field("Session"), "sealed_document": _field("Sealed document"),
+            "files": len(others)}
+
+
+def verify_media_companion(zip_bytes: bytes, *, original: Optional[bytes] = None,
+                           tsl_files=None, extra_certs=None) -> VerifyReport:
+    """1.7.3: the companion media ZIP given on its own. It is not evidence by
+    itself (no seal). Alone → NOT_VERIFIABLE with the exact command to run;
+    with --original <sealed PDF> → the same as `<pdf> --media <this zip>`."""
+    try:
+        ident = media_companion_identification(zipfile.ZipFile(io.BytesIO(zip_bytes))) or {}
+    except Exception:
+        ident = {}
+    doc = ident.get("sealed_document") or "GetProofAnchor_sess-….pdf"
+    if original is not None:
+        from .dispatch import detect_kind
+        if detect_kind(original) != "sealed_pdf":
+            report = VerifyReport()
+            report.bundle_format = "getproofanchor-fb-media-companion (unsealed)"
+            report.proof_id = ident.get("session_id")
+            report.checks.append(CheckResult(
+                "original_kind", False,
+                detail=(f"--original must be the sealed PDF ({doc}); the given file is not a "
+                        "sealed GetProofAnchor PDF (an unsealed plain copy carries no seal)")))
+            return _finish(report, message=MEDIA_COMPANION_MESSAGE)
+        rep = verify_sealed_pdf(original, tsl_files=tsl_files, extra_certs=extra_certs,
+                                media_zip=zip_bytes)
+        notes = list(rep.summary.get("notes") or [])
+        notes.insert(0, "Verified as: gpa-verify <sealed PDF given with --original> --media "
+                        "<this archive> — the verdict is that of the sealed PDF and its media.")
+        rep.summary["notes"] = notes
+        return rep
+    report = VerifyReport()
+    report.bundle_format = "getproofanchor-fb-media-companion (unsealed)"
+    report.proof_id = ident.get("session_id")
+    report.checks.append(CheckResult(
+        "media_companion", False, skipped=True,
+        detail=(f"companion media archive ({ident.get('files', '?')} file(s)) of the sealed document "
+                f"{doc}; it carries no seal and is not verifiable by itself")))
+    return _finish(report, verdict=VERDICT_NOT_VERIFIABLE, notes=[
+        f"Run: gpa-verify {doc} --media <this archive>",
+        "The SHA-256 of every media file is sealed in that PDF; gpa-verify compares them "
+        "with the files in this archive (check external_media).",
+    ], message=MEDIA_COMPANION_MESSAGE, **({"sealed_document": ident["sealed_document"]}
+                                           if ident.get("sealed_document") else {}))
+
+
 SAAS_REPORT_MESSAGE = ("This is the unsealed human-readable report of a SaaS proof — "
                        "verify its Evidence ZIP instead")
 

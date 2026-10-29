@@ -7,6 +7,7 @@ gpa_verify.dispatch — auto-detect the input kind and route it.
   Unsealed plain copy PDF      → forensic_browser.verify_plain_copy
   Unsealed package report PDF  → forensic_browser.verify_fb_report
   Unsealed SaaS report.pdf     → forensic_browser.verify_saas_report (1.7.1)
+  FB companion media ZIP       → forensic_browser.verify_media_companion (1.7.3)
 """
 
 from __future__ import annotations
@@ -20,8 +21,8 @@ from .core import CheckResult, VerifyReport
 
 
 def detect_kind(data: bytes) -> str:
-    """Return one of: saas_zip, fb_zip, zip_unknown, sealed_pdf, plain_copy,
-    fb_report, saas_report, pdf_unsigned, pdf_damaged, unknown."""
+    """Return one of: saas_zip, fb_zip, fb_media_zip, zip_unknown, sealed_pdf,
+    plain_copy, fb_report, saas_report, pdf_unsigned, pdf_damaged, unknown."""
     if data[:4] == b"PK\x03\x04" or data[:4] == b"PK\x05\x06":
         try:
             zf = zipfile.ZipFile(io.BytesIO(data))
@@ -38,6 +39,9 @@ def detect_kind(data: bytes) -> str:
                 return None
         man, proof = _j("manifest.json"), _j("proof.json")
         if man is None:
+            from .forensic_browser import media_companion_identification
+            if media_companion_identification(zf) is not None:
+                return "fb_media_zip"   # 1.7.3
             return "zip_unknown"
         return "fb_zip" if is_fb_manifest(man, proof) else "saas_zip"
     if b"%PDF-" in data[:1024]:
@@ -126,6 +130,8 @@ def _route(kind, data, original, original_name, tsl, certs, bitcoin_rpc, media=N
         return FB.verify_fb_report(data, original=original)
     if kind == "saas_report":
         return FB.verify_saas_report(data, original=original)
+    if kind == "fb_media_zip":
+        return FB.verify_media_companion(data, original=original, tsl_files=tsl, extra_certs=certs)
     rep = VerifyReport(bundle_format="unknown")
     rep.checks.append(CheckResult(
         "input_format", False,
